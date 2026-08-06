@@ -14,16 +14,27 @@ import {
   getActiveRefreshFailureKind,
   getCachedCredentials,
   getCredentialsWithBackoff,
+  noteAccountSucceeded,
   reloadCredentialsFromSource,
+  rotateAfterRateLimit,
   type ClaudeAccount,
   type ClaudeCredentials,
 } from "./credentials.ts"
 import { fetchWithRetry } from "./http.ts"
 import { log } from "./logger.ts"
+import { getRotationConfig } from "./rotation.ts"
 import { getUserAgent } from "./model-config.ts"
 import { transformBody, transformResponseStream } from "./transforms.ts"
 
 const sessionID = crypto.randomUUID()
+
+/**
+ * Upper bound on cross-account rotations per response. Accounts benched by an
+ * earlier rotation in this same response are skipped via `triedSources`, so
+ * the pool size is the natural limit; this constant only guards against a
+ * pathological re-rate-limit loop.
+ */
+const MAX_ROTATIONS = 8
 
 type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
@@ -189,6 +200,15 @@ export async function finishClaudeResponse(
 
   let response = initial
 
+  // The account that served the response being processed. Rotation moves it
+  // forward through the pool; accounts already tried for this response are
+  // never revisited.
+  let servingSource =
+    resolveAccount(source)?.source ??
+    (typeof source === "string" ? source : getActiveAccount()?.source)
+  const triedSources = new Set<string>()
+  if (servingSource) triedSources.add(servingSource)
+
   for (let attempt = 0; response.status === 401 && attempt < 2; attempt++) {
     let candidate: ClaudeCredentials | null =
       reloadCredentialsFromSource(account)
@@ -211,6 +231,38 @@ export async function finishClaudeResponse(
     }
   }
 
+  // Cross-account rotation: a 429 that survived the same-account resync means
+  // this account is rate-limited. Bench it with a cooldown derived from the
+  // response and retry on the next eligible account in the pool. Long-context
+  // 429s skip rotation — the 1M-window limit applies to every account
+  // equally, and the beta-exclusion loop below is their remedy.
+  if (response.status === 429 && servingSource && getRotationConfig().enabled) {
+    for (
+      let rotation = 0;
+      rotation < MAX_ROTATIONS && response.status === 429;
+      rotation++
+    ) {
+      const body = await response.clone().text()
+      if (isLongContextError(body)) break
+      const rotated = await rotateAfterRateLimit({
+        limitedSource: servingSource,
+        headers: response.headers,
+        body,
+        triedSources,
+      })
+      if (!rotated) break
+      servingSource = rotated.account.source
+      triedSources.add(servingSource)
+      token = rotated.credentials.accessToken
+      log("rotation_retry", {
+        modelID,
+        source: servingSource,
+        rotation: rotation + 1,
+      })
+      response = await sendWithToken(token)
+    }
+  }
+
   for (let attempt = 0; attempt < LONG_CONTEXT_BETAS.length; attempt++) {
     if (response.status !== 400 && response.status !== 429) break
     if (!isLongContextError(await response.clone().text())) break
@@ -219,6 +271,11 @@ export async function finishClaudeResponse(
     addExcludedBeta(modelID, beta)
     response = await sendWithToken(token, getExcludedBetas(modelID))
   }
+
+  // A success clears the serving account's bench, so an account whose limit
+  // reset earlier than its recorded cooldown stops being skipped as soon as
+  // it proves itself.
+  if (response.ok && servingSource) noteAccountSucceeded(servingSource)
 
   if (!response.ok)
     log("fetch_error_response", { status: response.status, modelID })

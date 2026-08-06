@@ -28,6 +28,18 @@ process.env.OPENCODE_CLAUDE_AUTH_REFRESH_LOCK_DIR = mkdtempSync(
   join(tmpdir(), "opencode-claude-auth-locktest-"),
 )
 
+// Same for rotation cooldowns and the pasted-token store. Both are resolved at
+// call time, so redirecting them here covers the copied modules the harnesses
+// below load out of temp directories.
+const stateTestDir = mkdtempSync(
+  join(tmpdir(), "opencode-claude-auth-statetest-"),
+)
+process.env.OPENCODE_CLAUDE_AUTH_ROTATION_FILE = join(
+  stateTestDir,
+  "rotation.json",
+)
+process.env.OPENCODE_CLAUDE_AUTH_TOKENS_FILE = join(stateTestDir, "tokens.json")
+
 type Creds = {
   accessToken: string
   refreshToken: string
@@ -135,6 +147,18 @@ async function loadCredentialsWithCountingKeychain(
     await readFile(new URL("./refresh-lock.ts", import.meta.url), "utf8"),
     "utf8",
   )
+  // Real implementations rather than stubs: both are pure over env-configured
+  // state files, which this file redirects to a temp dir at import time.
+  await writeFile(
+    join(tempDir, "token-store.ts"),
+    await readFile(new URL("./token-store.ts", import.meta.url), "utf8"),
+    "utf8",
+  )
+  await writeFile(
+    join(tempDir, "rotation.ts"),
+    await readFile(new URL("./rotation.ts", import.meta.url), "utf8"),
+    "utf8",
+  )
   const rewritten = sourceCredentials
     .replace(/from\s+["']\.\/(\w+)\.js["']/g, 'from "./$1.ts"')
     .replace(
@@ -201,6 +225,15 @@ let credentials = {
 const bySource = {}
 
 export const PRIMARY_SERVICE = "Claude Code-credentials"
+
+export function isStaticCredential(creds) {
+  return creds.kind === "static"
+}
+
+export function isCredentialUsable(creds, now = Date.now(), thresholdMs = 60_000) {
+  if (isStaticCredential(creds)) return true
+  return creds.expiresAt > now + thresholdMs
+}
 
 export function readAllClaudeAccounts() {
   readCount += 1
@@ -1482,6 +1515,16 @@ describe("syncAuthJson file permissions", () => {
         await readFile(new URL("./refresh-lock.ts", import.meta.url), "utf8"),
         "utf8",
       )
+      await writeFile(
+        join(tempDir, "token-store.ts"),
+        await readFile(new URL("./token-store.ts", import.meta.url), "utf8"),
+        "utf8",
+      )
+      await writeFile(
+        join(tempDir, "rotation.ts"),
+        await readFile(new URL("./rotation.ts", import.meta.url), "utf8"),
+        "utf8",
+      )
       const rewritten = sourceCredentials.replace(
         /from\s+["']\.\/(\w+)\.js["']/g,
         'from "./$1.ts"',
@@ -1490,6 +1533,15 @@ describe("syncAuthJson file permissions", () => {
       await writeFile(
         tempKeychain,
         `export const PRIMARY_SERVICE = "Claude Code-credentials"
+
+export function isStaticCredential(creds) {
+  return creds.kind === "static"
+}
+
+export function isCredentialUsable(creds, now = Date.now(), thresholdMs = 60_000) {
+  if (isStaticCredential(creds)) return true
+  return creds.expiresAt > now + thresholdMs
+}
 export function readAllClaudeAccounts() { return [] }
 export function refreshAccount() { return null }
 export function writeBackCredentials() { return true }
@@ -1590,6 +1642,16 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         await readFile(new URL("./refresh-lock.ts", import.meta.url), "utf8"),
         "utf8",
       )
+      await writeFile(
+        join(tempDir, "token-store.ts"),
+        await readFile(new URL("./token-store.ts", import.meta.url), "utf8"),
+        "utf8",
+      )
+      await writeFile(
+        join(tempDir, "rotation.ts"),
+        await readFile(new URL("./rotation.ts", import.meta.url), "utf8"),
+        "utf8",
+      )
       const rewritten = sourceCredentials.replace(
         /from\s+["']\.\/(\w+)\.js["']/g,
         'from "./$1.ts"',
@@ -1598,6 +1660,15 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       await writeFile(
         tempKeychain,
         `export const PRIMARY_SERVICE = "Claude Code-credentials"
+
+export function isStaticCredential(creds) {
+  return creds.kind === "static"
+}
+
+export function isCredentialUsable(creds, now = Date.now(), thresholdMs = 60_000) {
+  if (isStaticCredential(creds)) return true
+  return creds.expiresAt > now + thresholdMs
+}
 export function readAllClaudeAccounts() { return [] }
 export function refreshAccount() { return null }
 export function writeBackCredentials() { return true }
