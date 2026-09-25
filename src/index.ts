@@ -39,11 +39,14 @@ import {
 } from "./credentials.ts"
 import {
   activeCooldowns,
+  clearWaitAttempt,
+  createWaitAttemptId,
   earliestCooldown,
   formatRemaining,
   getCooldownUntil,
   getRotationConfig,
   getRotationWaitConfig,
+  publishWaitAttempt,
 } from "./rotation.ts"
 import {
   addTokens,
@@ -431,7 +434,25 @@ const plugin: Plugin = async (pluginInput) => {
           baseURL: "https://api.anthropic.com/v1",
           async fetch(input: RequestInfo | URL, init?: RequestInit) {
             const requestInit = init ?? {}
-            let latest = await getCachedCredentials()
+            // The sticky source may have been benched by another concurrent
+            // request. Skip it before sending anything if a healthy source is
+            // already available — no unnecessary 429 just to trigger rotation.
+            if (
+              getRotationConfig().enabled &&
+              getActiveAccount() &&
+              getCooldownUntil(getActiveAccount()!.source) !== null
+            ) {
+              const eligible = await retryAfterCooldownWait({
+                triedSources: new Set<string>(),
+              })
+              if (eligible) syncAuthJson(eligible.credentials)
+            }
+            // Account selection is shared process state; another concurrent
+            // turn can switch it during our HTTP call. Attribute this request's
+            // response to the source whose token it actually sent.
+            const selectedAccount = getActiveAccount()
+            let servingSource = selectedAccount?.source ?? null
+            let latest = await getCachedCredentials(selectedAccount)
             if (!latest) {
               // A transient refresh rate-limit must not surface as a hard error.
               // Wait (bounded, abort-aware) for our cooldown to clear or for a
@@ -564,7 +585,9 @@ const plugin: Plugin = async (pluginInput) => {
               // the request. It logs so a future reload that does throw is
               // diagnosable rather than silently null-coalesced.
               try {
-                candidate = reloadCredentialsFromSource()
+                candidate = reloadCredentialsFromSource(
+                  servingSource ?? undefined,
+                )
               } catch (err) {
                 log("auth_recovery_reload_threw", {
                   modelId,
@@ -575,7 +598,10 @@ const plugin: Plugin = async (pluginInput) => {
 
               if (!candidate || candidate.accessToken === tokenInUse) {
                 try {
-                  candidate = await forceRefreshActiveAccount()
+                  candidate = await forceRefreshActiveAccount(
+                    undefined,
+                    servingSource ?? undefined,
+                  )
                 } catch (err) {
                   // A rejected refresh and a refresh that returned null are
                   // different operator-facing diagnoses; auth_recovery_
@@ -648,7 +674,9 @@ const plugin: Plugin = async (pluginInput) => {
               // does throw should be diagnosable rather than silently
               // coalesced to "nothing rotated".
               try {
-                rotated = reloadCredentialsFromSource()
+                rotated = reloadCredentialsFromSource(
+                  servingSource ?? undefined,
+                )
               } catch (err) {
                 log("rate_limit_reload_threw", {
                   modelId,
@@ -713,8 +741,7 @@ const plugin: Plugin = async (pluginInput) => {
               const rotationConfig = getRotationConfig()
               const waitConfig = getRotationWaitConfig()
               const triedSources = new Set<string>()
-              const startingAccount = getActiveAccount()
-              if (startingAccount) triedSources.add(startingAccount.source)
+              if (servingSource) triedSources.add(servingSource)
 
               // Human labels for toasts, seeded from the startup roster and
               // extended whenever rotation picks an account — the wait
@@ -724,8 +751,11 @@ const plugin: Plugin = async (pluginInput) => {
               let waitCycles = 0
               let waitedMs = 0
               let waitToastShown = false
+              const startedAtForRequest = rotationWaitDeps.now()
+              const waitId = createWaitAttemptId()
 
               const giveUp = (): void => {
+                clearWaitAttempt(waitId)
                 // Return the 429 so the user sees the real limit rather than
                 // a silent stall, and say which accounts are benched and for
                 // how long — that is the one piece of information the raw API
@@ -763,8 +793,7 @@ const plugin: Plugin = async (pluginInput) => {
                     break rotation
                   }
 
-                  const limitedSource =
-                    getActiveAccount()?.source ?? startingAccount?.source
+                  const limitedSource = servingSource
                   if (!limitedSource) break rotation
 
                   const rotated = await rotateAfterRateLimit({
@@ -780,6 +809,7 @@ const plugin: Plugin = async (pluginInput) => {
                   }
 
                   triedSources.add(rotated.account.source)
+                  servingSource = rotated.account.source
                   labels.set(rotated.account.source, rotated.account.label)
                   tokenInUse = rotated.credentials.accessToken
                   syncAuthJson(rotated.credentials)
@@ -889,8 +919,69 @@ const plugin: Plugin = async (pluginInput) => {
                 })
 
                 const waitSignal = requestInit.signal ?? undefined
-                await rotationWaitDeps.sleep(waitMs, waitSignal)
-                if (waitSignal?.aborted) {
+                // Publish the wait so quota-watch can show a live countdown.
+                // Refreshed at
+                // every chunk boundary; deleted on end/abort/give-up, so a
+                // lingering stale entry only ever means "the holding request
+                // died", never "a retry is secretly coming".
+                const sleepStartedAt = rotationWaitDeps.now()
+                const wakeDeadline = sleepStartedAt + waitMs
+                publishWaitAttempt(
+                  waitId,
+                  {
+                    cycle: waitCycles,
+                    startedAt: startedAtForRequest,
+                    plannedSource: earliest.source,
+                    plannedLabel: earliestLabel,
+                    until: wakeDeadline,
+                    waitMs,
+                  },
+                  rotationWaitDeps.now(),
+                )
+
+                const progressMs = waitConfig.progressMs
+                let aborted = false
+                try {
+                  for (;;) {
+                    const nowInner = rotationWaitDeps.now()
+                    const remainingMs = wakeDeadline - nowInner
+                    if (remainingMs <= 0) break
+                    const chunkMs =
+                      progressMs > 0
+                        ? Math.min(progressMs, remainingMs)
+                        : remainingMs
+                    await rotationWaitDeps.sleep(chunkMs, waitSignal)
+                    if (waitSignal?.aborted) {
+                      aborted = true
+                      break
+                    }
+                    // Preserve the single-shot behaviour with progress off,
+                    // including an injected sleeper whose clock doesn't move.
+                    if (progressMs <= 0) break
+                    const leftMs = wakeDeadline - rotationWaitDeps.now()
+                    if (leftMs <= 0) break
+                    publishWaitAttempt(
+                      waitId,
+                      {
+                        cycle: waitCycles,
+                        startedAt: startedAtForRequest,
+                        plannedSource: earliest.source,
+                        plannedLabel: earliestLabel,
+                        until: wakeDeadline,
+                        waitMs: leftMs,
+                      },
+                      rotationWaitDeps.now(),
+                    )
+                    notify(
+                      toastClient,
+                      `Next attempt in ~${formatRemaining(leftMs)} via ${earliestLabel}.`,
+                      "info",
+                    )
+                  }
+                } finally {
+                  clearWaitAttempt(waitId)
+                }
+                if (aborted) {
                   // The turn was cancelled mid-wait: surface the limit we were
                   // holding rather than firing one more request nobody reads.
                   log("rotation_wait_aborted", {
@@ -922,6 +1013,7 @@ const plugin: Plugin = async (pluginInput) => {
                 }
 
                 triedSources.add(woke.account.source)
+                servingSource = woke.account.source
                 labels.set(woke.account.source, woke.account.label)
                 tokenInUse = woke.credentials.accessToken
                 syncAuthJson(woke.credentials)
@@ -956,7 +1048,6 @@ const plugin: Plugin = async (pluginInput) => {
             // derived from a capped estimate should not outlive the limit it
             // was guessing at.
             if (response.ok) {
-              const servingSource = getActiveAccount()?.source
               if (servingSource) noteAccountSucceeded(servingSource)
             }
 

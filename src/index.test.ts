@@ -10,7 +10,7 @@ import {
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
-import { before, describe, it } from "node:test"
+import { before, beforeEach, describe, it } from "node:test"
 import { pathToFileURL } from "node:url"
 
 // Keep the cross-process refresh lock off the real OpenCode data dir in tests.
@@ -208,7 +208,7 @@ async function loadHelpersWithCountingKeychain(
   if (options.throwOnReload) {
     const tempCredentials = join(tempDir, "credentials.ts")
     const reloadSignature =
-      "export function reloadCredentialsFromSource(): ClaudeCredentials | null {"
+      "export function reloadCredentialsFromSource(\n  source?: string,\n): ClaudeCredentials | null {"
     const credentialsSource = await readFile(tempCredentials, "utf8")
     assert.ok(credentialsSource.includes(reloadSignature))
     await writeFile(
@@ -397,6 +397,14 @@ const realFs = {
 let helpers: typeof import("./index.ts")
 
 describe("exported helpers", () => {
+  beforeEach(() => {
+    // Several legacy 429 tests bench the same mocked source. Each test must
+    // start with fresh rotation state, just as it starts with a fresh keychain.
+    process.env.OPENCODE_CLAUDE_AUTH_ROTATION_FILE = join(
+      mkdtempSync(join(tmpdir(), "opencode-claude-auth-pertest-")),
+      "rotation.json",
+    )
+  })
   before(async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "opencode-claude-auth-"))
     const tempKeychain = join(tempDir, "keychain.ts")
@@ -1547,6 +1555,11 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
 
   it("auth fetch returns quota errors without writing over the terminal UI", async () => {
     const originalNow = Date.now
+    const originalRotationFile = process.env.OPENCODE_CLAUDE_AUTH_ROTATION_FILE
+    process.env.OPENCODE_CLAUDE_AUTH_ROTATION_FILE = join(
+      mkdtempSync(join(tmpdir(), "opencode-claude-auth-quota-test-")),
+      "rotation.json",
+    )
     const originalSetInterval = globalThis.setInterval
     const originalHome = process.env.HOME
     const originalFetch = globalThis.fetch
@@ -1627,6 +1640,9 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       globalThis.fetch = originalFetch
       console.warn = originalWarn
       delete process.env.OPENCODE_CLAUDE_AUTH_ROTATE_WAIT
+      if (originalRotationFile === undefined)
+        delete process.env.OPENCODE_CLAUDE_AUTH_ROTATION_FILE
+      else process.env.OPENCODE_CLAUDE_AUTH_ROTATION_FILE = originalRotationFile
       if (typeof originalHome === "string") {
         process.env.HOME = originalHome
       } else {
@@ -1776,7 +1792,11 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         },
       )
 
-      assert.equal(response.status, 429)
+      assert.equal(
+        response.status,
+        429,
+        `headers: ${authorizationHeaders.join(",")}`,
+      )
       assert.deepEqual(
         authorizationHeaders,
         ["Bearer token", "Bearer recovered-token"],

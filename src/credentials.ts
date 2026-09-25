@@ -1010,8 +1010,11 @@ export async function forceRefreshActiveAccount(
   refresh: (
     refreshToken: string,
   ) => Promise<ClaudeCredentials | null> = refreshViaOAuth,
+  source?: string,
 ): Promise<ClaudeCredentials | null> {
-  const account = getActiveAccount()
+  const account = source
+    ? allAccounts.find((item) => item.source === source)
+    : getActiveAccount()
   if (!account?.credentials.refreshToken) return null
 
   // These tokens belong to another account: exchanging them here would
@@ -1067,8 +1070,9 @@ export function invalidateCredentialCache(): void {
   }
 }
 
-export async function getCachedCredentials(): Promise<ClaudeCredentials | null> {
-  const account = getActiveAccount()
+export async function getCachedCredentials(
+  account: ClaudeAccount | null = getActiveAccount(),
+): Promise<ClaudeCredentials | null> {
   if (!account) return null
 
   const now = Date.now()
@@ -1192,8 +1196,12 @@ export function getActiveRefreshFailureKind(): RefreshFailureKind | null {
   return kind
 }
 
-export function reloadCredentialsFromSource(): ClaudeCredentials | null {
-  const account = getActiveAccount()
+export function reloadCredentialsFromSource(
+  source?: string,
+): ClaudeCredentials | null {
+  const account = source
+    ? allAccounts.find((item) => item.source === source)
+    : getActiveAccount()
   if (!account) return null
 
   let reloaded: ClaudeCredentials | null

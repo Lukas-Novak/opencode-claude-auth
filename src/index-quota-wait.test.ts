@@ -22,10 +22,14 @@ import { pathToFileURL } from "node:url"
 import { describe, it } from "node:test"
 
 import {
+  clearWaitAttempt,
+  createWaitAttemptId,
   earliestCooldown,
   getRotationWaitConfig,
   markRateLimited,
+  publishWaitAttempt,
   readRotationState,
+  readWaitAttempts,
 } from "./rotation.ts"
 
 // ---------------------------------------------------------------------------
@@ -42,6 +46,39 @@ function isolateRotationFile(): void {
 }
 
 describe("rotation wait — unit", () => {
+  it("keeps concurrent requests' wait publications separate", () => {
+    const previous = process.env.OPENCODE_CLAUDE_AUTH_WAIT_DIR
+    process.env.OPENCODE_CLAUDE_AUTH_WAIT_DIR = mkdtempSync(
+      join(tmpdir(), "opencode-claude-auth-waits-concurrent-"),
+    )
+    const a = createWaitAttemptId()
+    const b = createWaitAttemptId()
+    try {
+      const state = {
+        cycle: 1,
+        startedAt: NOW,
+        plannedSource: "acct-a",
+        plannedLabel: "Account A",
+        until: NOW + 120_000,
+        waitMs: 120_000,
+      }
+      publishWaitAttempt(a, state, NOW)
+      publishWaitAttempt(b, { ...state, plannedSource: "acct-b" }, NOW)
+      assert.equal(readWaitAttempts().length, 2)
+      clearWaitAttempt(a)
+      assert.deepEqual(
+        readWaitAttempts().map((wait) => wait.id),
+        [b],
+      )
+      clearWaitAttempt(b)
+      assert.deepEqual(readWaitAttempts(), [])
+    } finally {
+      if (previous === undefined)
+        delete process.env.OPENCODE_CLAUDE_AUTH_WAIT_DIR
+      else process.env.OPENCODE_CLAUDE_AUTH_WAIT_DIR = previous
+    }
+  })
+
   describe("getRotationWaitConfig", () => {
     it("defaults to enabled with unbounded budgets and a small margin", () => {
       const config = getRotationWaitConfig()
@@ -291,7 +328,9 @@ interface Harness {
   helpersModule: PluginModule
   calls: FetchCall[]
   clock: { nowMs: number; sleeps: number[] }
-  setRespond: (fn: (callIndex: number, auth: string) => Response) => void
+  setRespond: (
+    fn: (callIndex: number, auth: string) => Response | Promise<Response>,
+  ) => void
   callFetch: (opts?: { signal?: AbortSignal }) => Promise<Response>
   rotationStatePath: string
   homeDir: string
@@ -328,6 +367,7 @@ async function setupHarness(opts: {
   jitterMs?: number
   maxCycles?: number
   maxWaitMs?: number
+  progressMs?: number
   sleepImpl?: (
     ms: number,
     signal: AbortSignal | null | undefined,
@@ -343,6 +383,9 @@ async function setupHarness(opts: {
     mkdtempSync(join(tmpdir(), "opencode-claude-auth-waitoks-")),
     "tokens.json",
   )
+  const waitStateDir = mkdtempSync(
+    join(tmpdir(), "opencode-claude-auth-waitpub-"),
+  )
 
   const originalHome = process.env.HOME
   const originalFetch = globalThis.fetch
@@ -352,6 +395,7 @@ async function setupHarness(opts: {
   process.env.HOME = homeDir
   process.env.OPENCODE_CLAUDE_AUTH_ROTATION_FILE = rotationStatePath
   process.env.OPENCODE_CLAUDE_AUTH_TOKENS_FILE = tokensPath
+  process.env.OPENCODE_CLAUDE_AUTH_WAIT_DIR = waitStateDir
   delete process.env.OPENCODE_CLAUDE_AUTH_TOKENS
   delete process.env.CLAUDE_CODE_OAUTH_TOKEN
   delete process.env.OPENCODE_CLAUDE_AUTH_ROTATE
@@ -366,6 +410,9 @@ async function setupHarness(opts: {
   // otherwise short retry-afters and bare 429s trigger its real 2s/4s sleeps
   // and re-fetch three times per scripted slot, breaking the call counts.
   process.env.OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS = "1"
+  // Waits historically sleep in one shot unless a test opts into ticks.
+  process.env.OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_PROGRESS_MS =
+    opts.progressMs !== undefined ? String(opts.progressMs) : "0"
   if (opts.marginMs !== undefined) {
     process.env.OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_MARGIN_MS = String(
       opts.marginMs,
@@ -390,8 +437,10 @@ async function setupHarness(opts: {
   })) as unknown as typeof setInterval
 
   const calls: FetchCall[] = []
-  let respond: (callIndex: number, auth: string) => Response = () =>
-    okResponse()
+  let respond: (
+    callIndex: number,
+    auth: string,
+  ) => Response | Promise<Response> = () => okResponse()
   globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
     const headers = new Headers(init?.headers)
     const auth = headers.get("authorization") ?? ""
@@ -551,6 +600,8 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     delete process.env.OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_MAX_CYCLES
     delete process.env.OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_MAX_MS
     delete process.env.OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS
+    delete process.env.OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_PROGRESS_MS
+    delete process.env.OPENCODE_CLAUDE_AUTH_WAIT_DIR
     rmSync(tempDir, { recursive: true, force: true })
   }
 
@@ -579,6 +630,99 @@ const accountC = { source: "acct-c", label: "Account C", token: "token-c" }
 // ---------------------------------------------------------------------------
 
 describe("quota wait — integration", () => {
+  it("attributes a delayed 429 to the account whose token was sent, even after another request switches", async () => {
+    const h = await setupHarness({ accounts: [accountA, accountB] })
+    try {
+      let releaseFirst: ((response: Response) => void) | undefined
+      h.setRespond((index) => {
+        if (index === 0) {
+          return new Promise<Response>((resolve) => {
+            releaseFirst = resolve
+          })
+        }
+        if (index === 1) return rateLimited(90)
+        return okResponse()
+      })
+      const plugin = await h.helpersModule.default({} as never)
+      const auth = await (
+        plugin as {
+          auth: {
+            loader: (
+              getAuth: () => Promise<unknown>,
+              provider: { models: Record<string, never> },
+            ) => Promise<{ fetch: typeof fetch }>
+          }
+        }
+      ).auth.loader(
+        async () => ({
+          type: "oauth",
+          access: "x",
+          refresh: "x",
+          expires: NOW + 1_000_000,
+        }),
+        { models: {} },
+      )
+      const send = () =>
+        auth.fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
+        })
+      const first = send()
+      for (let i = 0; i < 100 && !releaseFirst; i++) {
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+      assert.ok(releaseFirst)
+      assert.equal((await send()).status, 200)
+      releaseFirst(rateLimited(90))
+      assert.equal((await first).status, 200)
+      assert.equal(h.calls[0]?.auth, "Bearer token-a")
+      assert.equal(h.calls[1]?.auth, "Bearer token-a")
+      assert.equal(readRotationState().cooldowns["acct-b"], undefined)
+      assert.ok(readRotationState().cooldowns["acct-a"])
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it("skips a newly benched sticky account before its next API call", async () => {
+    const h = await setupHarness({ accounts: [accountA, accountB] })
+    try {
+      const plugin = await h.helpersModule.default({} as never)
+      const auth = await (
+        plugin as {
+          auth: {
+            loader: (
+              getAuth: () => Promise<unknown>,
+              provider: { models: Record<string, never> },
+            ) => Promise<{ fetch: typeof fetch }>
+          }
+        }
+      ).auth.loader(
+        async () => ({
+          type: "oauth",
+          access: "x",
+          refresh: "x",
+          expires: NOW + 1_000_000,
+        }),
+        { models: {} },
+      )
+      const request = () =>
+        auth.fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
+        })
+      h.setRespond(() => okResponse())
+      assert.equal((await request()).status, 200)
+      assert.equal(h.calls[0]?.auth, "Bearer token-a")
+      markRateLimited("acct-a", 120_000, "retry-after", h.clock.nowMs)
+      assert.equal((await request()).status, 200)
+      assert.equal(h.calls[1]?.auth, "Bearer token-b")
+      assert.equal(h.calls.length, 2, "no probe of the benched source")
+    } finally {
+      h.cleanup()
+    }
+  })
+
   it("fails over A -> B when only A is limited, replaying the identical request", async () => {
     const h = await setupHarness({ accounts: [accountA, accountB] })
     try {
@@ -1059,6 +1203,124 @@ describe("quota wait — integration", () => {
       assert.ok(
         !content.includes('"token-b"'),
         "account tokens never reach the log",
+      )
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it("publishes a live wait-state countdown and clears it on wake", async () => {
+    const snapshots: { atMs: number; active: unknown }[] = []
+    const h = await setupHarness({
+      accounts: [accountA],
+      progressMs: 100,
+      sleepImpl: (ms, _signal, clock) => {
+        clock.sleeps.push(ms)
+        clock.nowMs += ms
+        snapshots.push({
+          atMs: clock.nowMs,
+          active: readWaitAttempts()[0]?.active,
+        })
+        return Promise.resolve()
+      },
+    })
+    try {
+      h.setRespond((i) => (i === 0 ? rateLimited(45) : okResponse()))
+
+      const response = await h.callFetch()
+
+      assert.equal(response.status, 200)
+      // 45s bench + 1s margin → a ~46s wait in 100ms fake-time chunks.
+      const expectedWait = 45_000 + 1_000
+      assert.equal(
+        h.clock.sleeps.reduce((a, b) => a + b, 0),
+        expectedWait,
+        "chunked sleeps must sum to the planned wait",
+      )
+      assert.ok(h.clock.sleeps.length > 100, "many progress chunks")
+      assert.ok(
+        h.clock.sleeps.every((s) => s <= 100),
+        "no chunk exceeds the tick period",
+      )
+
+      // Publication was live during the wait with the planned account…
+      const first = snapshots[0]?.active as {
+        plannedSource?: string
+        plannedLabel?: string
+        until?: number
+        waitMs?: number
+        updatedAt?: number
+      } | null
+      assert.ok(first, "wait-state published before the first chunk")
+      assert.equal(first?.plannedSource, "acct-a")
+      assert.ok(first?.plannedLabel?.includes("Account A"))
+      assert.equal(first?.waitMs, expectedWait)
+
+      // …the remaining time decreases monotonically across ticks…
+      const remainings = snapshots.map(
+        (s) => (s.active as { until?: number; at?: number })?.until ?? 0,
+      )
+      assert.ok(
+        remainings.every((u, i) => i === 0 || (u ?? 0) === remainings[0]),
+        "wake deadline stays fixed across ticks",
+      )
+      // …updatedAt advances while the wait is alive (staleness detection):
+      const updates = snapshots.map(
+        (s) => (s.active as { updatedAt?: number })?.updatedAt ?? 0,
+      )
+      assert.ok(
+        updates.every((u, i) => i === 0 || (u ?? 0) > (updates[i - 1] ?? 0)),
+        `updatedAt must increase monotonically per chunk: ${JSON.stringify(updates.slice(0, 12))}`,
+      )
+
+      // …and the publication is gone once the wait has ended.
+      assert.equal(
+        readWaitAttempts().length,
+        0,
+        "wait-state must be cleared after the wake",
+      )
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it("clears the wait-state publication when the wait is aborted", async () => {
+    const h = await setupHarness({
+      accounts: [accountA],
+      progressMs: 100,
+      sleepImpl: (ms, signal, clock) => {
+        clock.sleeps.push(ms)
+        return new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve()
+            return
+          }
+          signal?.addEventListener("abort", () => resolve(), { once: true })
+        })
+      },
+    })
+    try {
+      h.setRespond(() => rateLimited(300))
+      const controller = new AbortController()
+
+      const pending = h.callFetch({ signal: controller.signal })
+      for (let i = 0; i < 100 && h.clock.sleeps.length === 0; i++) {
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+      assert.equal(h.clock.sleeps.length, 1)
+      assert.ok(
+        readWaitAttempts()[0]?.active,
+        "publication live before the abort",
+      )
+
+      controller.abort()
+      const response = await pending
+
+      assert.equal(response.status, 429)
+      assert.equal(
+        readWaitAttempts().length,
+        0,
+        "publication must die with its request",
       )
     } finally {
       h.cleanup()
