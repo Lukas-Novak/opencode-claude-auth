@@ -1038,8 +1038,11 @@ export async function forceRefreshActiveAccount(
   refresh: (
     refreshToken: string,
   ) => Promise<ClaudeCredentials | null> = refreshViaOAuth,
-  account: ClaudeAccount | null = getActiveAccount(),
+  source?: string,
 ): Promise<ClaudeCredentials | null> {
+  const account = source
+    ? allAccounts.find((item) => item.source === source)
+    : getActiveAccount()
   if (!account?.credentials.refreshToken) return null
 
   // These tokens belong to another account: exchanging them here would
@@ -1139,7 +1142,7 @@ const REFRESH_WAIT_MS = (() => {
 
 const REFRESH_POLL_MS = 2_500
 
-function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+export function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal?.aborted) {
       resolve()
@@ -1225,8 +1228,11 @@ export function getActiveRefreshFailureKind(
 }
 
 export function reloadCredentialsFromSource(
-  account: ClaudeAccount | null = getActiveAccount(),
+  source?: string,
 ): ClaudeCredentials | null {
+  const account = source
+    ? allAccounts.find((item) => item.source === source)
+    : getActiveAccount()
   if (!account) return null
 
   let reloaded: ClaudeCredentials | null
@@ -1350,6 +1356,41 @@ export async function rotateAfterRateLimit(options: {
     cooldownMs: ms,
     reason,
   })
+  return { account: next, credentials }
+}
+
+/**
+ * Pick the next eligible account WITHOUT benching anyone — used after a quota
+ * wait elapses (the elapsed bench is history, nobody was just limited) and to
+ * preempt a request-facing account found benched before anything is sent.
+ * Mirrors rotateAfterRateLimit's roster selection and credential resolution —
+ * an OAuth account coming off the bench may need a real refresh — minus
+ * markRateLimited.
+ */
+export async function retryAfterCooldownWait(options: {
+  triedSources?: Iterable<string>
+  now?: number
+}): Promise<{ account: ClaudeAccount; credentials: ClaudeCredentials } | null> {
+  const config = getRotationConfig()
+  if (!config.enabled) return null
+
+  const now = options.now ?? Date.now()
+  const roster = refreshAccountsList()
+  const next = pickNextAccount(
+    roster,
+    new Set(options.triedSources ?? []),
+    now,
+    config,
+  )
+  if (!next) return null
+
+  setActiveAccountSource(next.source)
+  saveAccountSource(next.source)
+  const credentials = await getCachedCredentials()
+  if (!credentials) {
+    log("rotation_wait_target_unusable", { target: next.source })
+    return null
+  }
   return { account: next, credentials }
 }
 

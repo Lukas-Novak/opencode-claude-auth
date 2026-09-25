@@ -10,7 +10,8 @@ wrapper into OpenCode 2's `http.request` / `http.response` hooks.
 
 * accept long-lived tokens pasted from `claude setup-token`, as an additional credential source alongside the Keychain and credentials file. Tokens paste in via `/connect` ("Add Claude token"), or through `OPENCODE_CLAUDE_AUTH_TOKENS` / `CLAUDE_CODE_OAUTH_TOKEN` for headless use. Such tokens are modelled as static credentials: never refreshed, never written back.
 * rotate accounts automatically on rate limits. The limited account is benched for a cooldown derived from `retry-after` / `anthropic-ratelimit-unified-*-reset` (short default for an unexplained 429, capped at 6h), the request retries in-flight on the next healthy account in priority order, and benches persist across restarts. Configurable via `OPENCODE_CLAUDE_AUTH_ROTATE*` and `OPENCODE_CLAUDE_AUTH_ACCOUNT_ORDER`; long-context 429s are excluded, since they affect every account equally.
-* skip accounts still benched from an earlier session when choosing the startup account.
+* wait out all-accounts-exhausted windows instead of failing. When every account is benched, tried, or broken, the request sleeps until the soonest bench expires (plus a safety margin and small jitter — real sleeping, no probing), publishes a live countdown for `scripts/quota-watch.mjs`, re-evaluates the pool from fresh persisted state, and resends the identical request. Cancellation via the request's abort signal stops the wait promptly; `OPENCODE_CLAUDE_AUTH_ROTATE_WAIT=0` restores fail-fast behaviour, `OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_MAX_CYCLES` / `_MAX_MS` bound it.
+* skip a sticky account found benched by a concurrent request before sending anything, including at session startup.
 * remove a stored token via `/connect` ("Remove a stored Claude token").
 
 ### Bug Fixes
@@ -19,8 +20,8 @@ wrapper into OpenCode 2's `http.request` / `http.response` hooks.
 
 ### Port simplifications vs the v1 fork
 
-* rate-limit recovery rides OpenCode 2's native request hooks: rotation happens inside the `http.response` hook instead of a replaced `fetch`. If every account is benched, the 429 surfaces and OpenCode's own retry/backoff re-enters the hook, so requests still complete once a cooldown elapses — but without the v1 fork's in-wrapper wait loop, countdown toasts and cross-process lock handoff.
-* account-switch and quota events go to the debug log only; TUI toasts are not ported yet.
+* rate-limit recovery rides OpenCode 2's native request hooks: rotation and quota waits happen inside the `http.response` hook instead of a replaced `fetch`. OpenCode enforces a per-attempt request timeout that will abort a long wait mid-sleep; the abort surfaces the 429, OpenCode retries on its own backoff, and the hook re-enters and keeps waiting, so long quota windows still resolve — just across several attempts instead of one unbroken sleep.
+* account-switch and quota progress go to the debug log and the quota-watch publication only; TUI toast notifications from the v1 fork are not ported (the hook has no TUI client).
 * the remove-token method's option list is built at startup; tokens added in the same session appear after a restart.
 
 ## [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/compare/v2.2.1...v3.0.0) (2026-10-16)

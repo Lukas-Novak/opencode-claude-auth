@@ -16,25 +16,27 @@ import {
   getCredentialsWithBackoff,
   noteAccountSucceeded,
   reloadCredentialsFromSource,
+  retryAfterCooldownWait,
   rotateAfterRateLimit,
+  sleepAbortable,
   type ClaudeAccount,
   type ClaudeCredentials,
 } from "./credentials.ts"
 import { fetchWithRetry } from "./http.ts"
 import { log } from "./logger.ts"
-import { getRotationConfig } from "./rotation.ts"
+import {
+  clearWaitAttempt,
+  createWaitAttemptId,
+  earliestCooldown,
+  getRotationConfig,
+  getRotationWaitConfig,
+  isCoolingDown,
+  publishWaitAttempt,
+} from "./rotation.ts"
 import { getUserAgent } from "./model-config.ts"
 import { transformBody, transformResponseStream } from "./transforms.ts"
 
 const sessionID = crypto.randomUUID()
-
-/**
- * Upper bound on cross-account rotations per response. Accounts benched by an
- * earlier rotation in this same response are skipped via `triedSources`, so
- * the pool size is the natural limit; this constant only guards against a
- * pathological re-rate-limit loop.
- */
-const MAX_ROTATIONS = 8
 
 type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
@@ -126,7 +128,27 @@ export async function prepareClaudeRequest(
 ): Promise<Request> {
   const body = await request.clone().text()
   const modelID = modelFromBody(body)
-  const account = resolveAccount(source)
+  let account = resolveAccount(source)
+  // The sticky account may have been benched by another concurrent request.
+  // Step to a healthy one before sending anything rather than spending a 429
+  // just to trigger rotation.
+  if (
+    getRotationConfig().enabled &&
+    account &&
+    isCoolingDown(account.source)
+  ) {
+    const eligible = await retryAfterCooldownWait({
+      triedSources: new Set<string>([account.source]),
+    })
+    if (eligible) {
+      log("rotation_preempted_bench", {
+        modelID,
+        from: account.source,
+        to: eligible.account.source,
+      })
+      account = eligible.account
+    }
+  }
   const credentials =
     (await getCachedCredentials(account)) ??
     (await getCredentialsWithBackoff({}, account))
@@ -211,9 +233,9 @@ export async function finishClaudeResponse(
 
   for (let attempt = 0; response.status === 401 && attempt < 2; attempt++) {
     let candidate: ClaudeCredentials | null =
-      reloadCredentialsFromSource(account)
+      reloadCredentialsFromSource(account?.source)
     if (!candidate || candidate.accessToken === token)
-      candidate = await forceRefreshActiveAccount(undefined, account)
+      candidate = await forceRefreshActiveAccount(undefined, account?.source)
     if (!candidate || candidate.accessToken === token) break
     token = candidate.accessToken
     log("auth_recovery_retry", { modelID, attempt: attempt + 1 })
@@ -221,7 +243,7 @@ export async function finishClaudeResponse(
   }
 
   if (response.status === 429) {
-    const rotated = reloadCredentialsFromSource(account)
+    const rotated = reloadCredentialsFromSource(account?.source)
     if (rotated && rotated.accessToken !== token) {
       token = rotated.accessToken
       log("rate_limit_token_changed", { modelID })
@@ -233,32 +255,173 @@ export async function finishClaudeResponse(
 
   // Cross-account rotation: a 429 that survived the same-account resync means
   // this account is rate-limited. Bench it with a cooldown derived from the
-  // response and retry on the next eligible account in the pool. Long-context
-  // 429s skip rotation — the 1M-window limit applies to every account
+  // response and retry on the next eligible account in the pool. When every
+  // account is benched or tried, wait out the soonest bench instead of
+  // failing — a real chunked sleep, abort-aware, published for quota-watch —
+  // then re-evaluate the pool from fresh persisted state. Long-context 429s
+  // skip rotation entirely: the 1M-window limit applies to every account
   // equally, and the beta-exclusion loop below is their remedy.
   if (response.status === 429 && servingSource && getRotationConfig().enabled) {
-    for (
-      let rotation = 0;
-      rotation < MAX_ROTATIONS && response.status === 429;
-      rotation++
-    ) {
-      const body = await response.clone().text()
-      if (isLongContextError(body)) break
-      const rotated = await rotateAfterRateLimit({
-        limitedSource: servingSource,
-        headers: response.headers,
-        body,
-        triedSources,
-      })
-      if (!rotated) break
-      servingSource = rotated.account.source
-      triedSources.add(servingSource)
-      token = rotated.credentials.accessToken
-      log("rotation_retry", {
+    const rotationConfig = getRotationConfig()
+    const waitConfig = getRotationWaitConfig()
+    const waitId = createWaitAttemptId()
+    const startedAt = Date.now()
+    let waitCycles = 0
+    let waitedMs = 0
+
+    rotation: for (;;) {
+      let outOfCandidates = false
+
+      for (
+        let switchCount = 0;
+        switchCount < rotationConfig.maxSwitchesPerRequest;
+        switchCount++
+      ) {
+        if (response.status !== 429) break
+
+        // The body both excludes long-context errors and tells an explained
+        // usage limit from a bare 429. Cloned, so the response stays readable
+        // if it ends up returned.
+        let limitBody = ""
+        try {
+          limitBody = await response.clone().text()
+        } catch {
+          // An unreadable body is not a reason to skip rotation.
+        }
+        if (isLongContextError(limitBody)) {
+          log("rotation_skipped_long_context", { modelID })
+          break rotation
+        }
+        const limitedSource = servingSource
+        if (!limitedSource) break rotation
+
+        const rotated = await rotateAfterRateLimit({
+          limitedSource,
+          headers: response.headers,
+          body: limitBody,
+          triedSources,
+        })
+        if (!rotated) {
+          outOfCandidates = true
+          break
+        }
+        servingSource = rotated.account.source
+        triedSources.add(servingSource)
+        token = rotated.credentials.accessToken
+        log("rotation_retry", {
+          modelID,
+          source: servingSource,
+          rotation: switchCount + 1,
+        })
+        response = await sendWithToken(token)
+      }
+
+      if (response.status !== 429) break
+      if (!outOfCandidates) break
+      // The switch budget ran out with candidates left — a call-count bound,
+      // not a depleted pool — or waiting is disabled; either way no
+      // self-imposed sleep.
+      if (!waitConfig.enabled) break
+
+      // ----- all accounts benched, tried, or broken: the wait -----
+      const earliest = earliestCooldown()
+      if (!earliest) break // nobody benched: candidates failed credential validation, not quota
+      if (waitConfig.maxCycles > 0 && waitCycles >= waitConfig.maxCycles) {
+        log("rotation_wait_budget_exceeded", {
+          modelID,
+          budget: "cycles",
+          maxCycles: waitConfig.maxCycles,
+          waitedMs,
+        })
+        break
+      }
+      let waitMs = Math.max(
+        0,
+        earliest.until - Date.now() + waitConfig.marginMs,
+      )
+      waitMs += Math.floor(Math.random() * waitConfig.jitterMs)
+      if (
+        waitConfig.maxWaitTotalMs > 0 &&
+        waitedMs + waitMs > waitConfig.maxWaitTotalMs
+      ) {
+        log("rotation_wait_budget_exceeded", {
+          modelID,
+          budget: "total_ms",
+          maxWaitTotalMs: waitConfig.maxWaitTotalMs,
+          waitedMs,
+        })
+        break
+      }
+      waitCycles += 1
+      waitedMs += waitMs
+      log("rotation_wait_start", {
         modelID,
-        source: servingSource,
-        rotation: rotation + 1,
+        cycle: waitCycles,
+        earliestSource: earliest.source,
+        earliestAt: earliest.until,
+        waitMs,
       })
+
+      // Publish the wait so quota-watch shows a live countdown; refreshed at
+      // every chunk boundary and deleted on end/abort, so a lingering stale
+      // entry only ever means "the holding request died".
+      const wakeDeadline = Date.now() + waitMs
+      const signal = request.signal ?? undefined
+      const publish = (leftMs: number) =>
+        publishWaitAttempt(waitId, {
+          cycle: waitCycles,
+          startedAt,
+          plannedSource: earliest.source,
+          plannedLabel:
+            getAccountBySource(earliest.source)?.label ?? earliest.source,
+          until: wakeDeadline,
+          waitMs: leftMs,
+        })
+      publish(waitMs)
+
+      let aborted = false
+      try {
+        for (;;) {
+          const remainingMs = wakeDeadline - Date.now()
+          if (remainingMs <= 0) break
+          const chunkMs =
+            waitConfig.progressMs > 0
+              ? Math.min(waitConfig.progressMs, remainingMs)
+              : remainingMs
+          await sleepAbortable(chunkMs, signal)
+          if (signal?.aborted) {
+            aborted = true
+            break
+          }
+          if (waitConfig.progressMs <= 0) break
+          const leftMs = wakeDeadline - Date.now()
+          if (leftMs <= 0) break
+          publish(leftMs)
+        }
+      } finally {
+        clearWaitAttempt(waitId)
+      }
+      if (aborted) {
+        // The turn was cancelled mid-wait: surface the limit we were holding
+        // rather than firing one more request nobody reads.
+        log("rotation_wait_aborted", { modelID, cycle: waitCycles, waitedMs })
+        break
+      }
+      log("rotation_wait_wake", {
+        modelID,
+        cycle: waitCycles,
+        plannedSource: earliest.source,
+      })
+
+      // Never assume the planned account is healthy: benches may have been
+      // extended or cleared by sibling instances while we slept, so selection
+      // starts from fresh persisted state.
+      const woke = await retryAfterCooldownWait({ triedSources })
+      if (!woke) continue // recompute the earliest bench and sleep again
+      servingSource = woke.account.source
+      triedSources.add(servingSource)
+      token = woke.credentials.accessToken
+      log("rotation_wake_retry", { modelID, source: servingSource })
       response = await sendWithToken(token)
     }
   }

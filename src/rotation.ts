@@ -23,9 +23,12 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs"
+import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import type { ClaudeAccount } from "./keychain.ts"
@@ -55,6 +58,27 @@ export interface RotationConfig {
   maxSwitchesPerRequest: number
   /** Explicit source order; unlisted sources follow, in discovery order. */
   order: string[]
+}
+
+export interface RotationWaitConfig {
+  /** Master switch: wait out an all-accounts-benched window instead of failing. */
+  enabled: boolean
+  /** Max sleeps per request; 0 = unlimited. */
+  maxCycles: number
+  /** Max total sleep per request in ms; 0 = unlimited. */
+  maxWaitTotalMs: number
+  /** Small safety margin added after a reset, so we never fire milliseconds early. */
+  marginMs: number
+  /** Upper bound of the random extra delay, desynchronising sibling instances. */
+  jitterMs: number
+  /**
+   * Progress-tick period while waiting: the sleep is chunked at this
+   * granularity, each chunk refreshing the wait-state publication and a
+   * countdown toast. 0 = no periodic ticks (a single long sleep chunks).
+   * Defaults to 60s — well under the ~300s request timeout every OpenCode
+   * attempt enforces, so at least a few ticks surface per attempt.
+   */
+  progressMs: number
 }
 
 function envInt(name: string, fallback: number): number {
@@ -93,6 +117,34 @@ export function getRotationConfig(): RotationConfig {
       3,
     ),
     order,
+  }
+}
+
+export function getRotationWaitConfig(): RotationWaitConfig {
+  return {
+    enabled: process.env.OPENCODE_CLAUDE_AUTH_ROTATE_WAIT !== "0",
+    // Both budgets default to 0 = unlimited: the feature exists so a
+    // long-running task survives a quota window however long it is, and the
+    // abort signal is the real escape hatch. The caps exist for operators
+    // (and tests) that would rather fail after a bound.
+    maxCycles: Math.max(
+      0,
+      envInt("OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_MAX_CYCLES", 0),
+    ),
+    maxWaitTotalMs: Math.max(
+      0,
+      envInt("OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_MAX_MS", 0),
+    ),
+    marginMs: envInt("OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_MARGIN_MS", 1_000),
+    jitterMs: envInt("OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_JITTER_MS", 2_000),
+    // envInt's >0 rule turns "0" into the fallback, so handle the explicit
+    // opt-out separately: PROGRESS_MS=0 means no periodic ticks.
+    progressMs: (() => {
+      const raw = process.env.OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_PROGRESS_MS
+      if (raw === "0") return 0
+      const parsed = raw ? Number.parseInt(raw, 10) : NaN
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : 60_000
+    })(),
   }
 }
 
@@ -150,6 +202,130 @@ export function writeRotationState(state: RotationStateFile): boolean {
     })
     return false
   }
+}
+
+// ---------------------------------------------------------------------------
+// Wait-attempt publication
+//
+// Each concurrent request owns its own file. A single shared JSON file would
+// let one request's wake erase a sibling's live countdown; per-request files
+// also avoid cross-process read/modify/write races.
+// ---------------------------------------------------------------------------
+
+export interface WaitAttemptState {
+  version: 1
+  active: {
+    /** Epoch ms of the last publish tick; the watcher treats old values as stale. */
+    updatedAt: number
+    /** Which wait cycle of its request this is (1-based). */
+    cycle: number
+    /** When this request first entered its wait, epoch ms. */
+    startedAt: number
+    /** The account the wake is planned to try, and its display label. */
+    plannedSource: string
+    plannedLabel: string
+    /** Planned wake moment, epoch ms (reset + margin + jitter). */
+    until: number
+    /** Total planned sleep for this cycle, ms. */
+    waitMs: number
+  }
+}
+
+export function getWaitAttemptDir(): string {
+  const configured = process.env.OPENCODE_CLAUDE_AUTH_WAIT_DIR
+  if (configured) return configured
+  return join(dirname(getRotationStatePath()), "claude-auth-waits")
+}
+
+export function createWaitAttemptId(): string {
+  return `${process.pid}-${randomUUID()}`
+}
+
+function waitAttemptPath(id: string): string {
+  if (!/^[0-9a-f-]+$/.test(id)) throw new Error("Invalid wait ID")
+  return join(getWaitAttemptDir(), `${id}.json`)
+}
+
+export function readWaitAttempts(): Array<WaitAttemptState & { id: string }> {
+  try {
+    return readdirSync(getWaitAttemptDir())
+      .filter((name) => /^[0-9a-f-]+\.json$/.test(name))
+      .flatMap((name) => {
+        try {
+          const state = JSON.parse(
+            readFileSync(join(getWaitAttemptDir(), name), "utf-8"),
+          ) as WaitAttemptState
+          if (
+            state?.version !== 1 ||
+            !state.active ||
+            !Number.isFinite(state.active.until) ||
+            !Number.isFinite(state.active.updatedAt)
+          )
+            return []
+          return [{ ...state, id: name.slice(0, -5) }]
+        } catch {
+          return []
+        }
+      })
+  } catch {
+    return []
+  }
+}
+
+function writeWaitAttempt(id: string, state: WaitAttemptState): void {
+  const path = waitAttemptPath(id)
+  try {
+    const dir = dirname(path)
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const tmp = `${path}.${randomUUID()}.tmp`
+    const fd = openSync(tmp, "wx", 0o600)
+    try {
+      writeFileSync(fd, `${JSON.stringify(state, null, 2)}\n`, "utf-8")
+    } finally {
+      closeSync(fd)
+    }
+    renameSync(tmp, path)
+    if (process.platform !== "win32") chmodSync(path, 0o600)
+  } catch (err) {
+    log("wait_attempt_write_failed", {
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
+}
+
+/**
+ * Publish/refresh the in-flight quota wait. Called at every wait cycle start
+ * and every progress tick; `updatedAt` freshened on every call so a watcher
+ * distinguishes a live wait from a lingering corpse.
+ */
+export function publishWaitAttempt(
+  id: string,
+  entry: Omit<WaitAttemptState["active"], "updatedAt">,
+  now = Date.now(),
+): void {
+  writeWaitAttempt(id, { version: 1, active: { ...entry, updatedAt: now } })
+}
+
+/** Remove only this request's publication; sibling waits are unaffected. */
+export function clearWaitAttempt(id: string): void {
+  try {
+    unlinkSync(waitAttemptPath(id))
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      log("wait_attempt_clear_failed", {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+}
+
+/**
+ * How old a publication may be before a watcher should treat it as a corpse
+ * rather than a live wait: two tick periods plus grace. Anything the plugin
+ * actively holds gets refreshed well within this.
+ */
+export function waitAttemptStaleMs(progressMs: number): number {
+  return Math.max(90_000, 2 * progressMs + 30_000)
 }
 
 /**
@@ -355,6 +531,17 @@ export function activeCooldowns(now = Date.now()): CooldownStatus[] {
       reason: entry.reason,
     }))
     .sort((a, b) => a.remainingMs - b.remainingMs)
+}
+
+/**
+ * The soonest-expiring live bench, for planning a quota wait. Live benches
+ * only — a pool drained by credential validation failures rather than quota
+ * checks returns null, so a broken account can never manufacture a wait.
+ */
+export function earliestCooldown(now = Date.now()): CooldownStatus | null {
+  const live = activeCooldowns(now)
+  if (live.length === 0) return null
+  return live.reduce((a, b) => (b.until < a.until ? b : a))
 }
 
 export function formatRemaining(ms: number): string {
