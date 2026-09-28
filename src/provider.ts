@@ -18,25 +18,34 @@ import {
   reloadCredentialsFromSource,
   retryAfterCooldownWait,
   rotateAfterRateLimit,
-  sleepAbortable,
   type ClaudeAccount,
   type ClaudeCredentials,
 } from "./credentials.ts"
-import { fetchWithRetry } from "./http.ts"
+import { fetchWithRetry, sleepUntilStateChange, stateRevision } from "./http.ts"
 import { log } from "./logger.ts"
 import {
   clearWaitAttempt,
   createWaitAttemptId,
   earliestCooldown,
   getRotationConfig,
+  getRotationStatePath,
   getRotationWaitConfig,
   isCoolingDown,
   publishWaitAttempt,
 } from "./rotation.ts"
+import { getTokenStorePath } from "./token-store.ts"
 import { getUserAgent } from "./model-config.ts"
 import { transformBody, transformResponseStream } from "./transforms.ts"
 
 const sessionID = crypto.randomUUID()
+
+/** Files whose change means a sleeping quota wait should re-plan early. */
+const availabilityPaths = () => [getRotationStatePath(), getTokenStorePath()]
+/** Chunked wait sleep that wakes early when the local pool state changes. */
+const availabilitySleep = (
+  ms: number,
+  signal: AbortSignal | null | undefined,
+) => sleepUntilStateChange(ms, signal, availabilityPaths(), stateRevision(availabilityPaths()))
 
 type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
@@ -388,7 +397,7 @@ export async function finishClaudeResponse(
             waitConfig.progressMs > 0
               ? Math.min(waitConfig.progressMs, remainingMs)
               : remainingMs
-          await sleepAbortable(chunkMs, signal)
+          await availabilitySleep(chunkMs, signal)
           if (signal?.aborted) {
             aborted = true
             break
@@ -416,7 +425,10 @@ export async function finishClaudeResponse(
       // Never assume the planned account is healthy: benches may have been
       // extended or cleared by sibling instances while we slept, so selection
       // starts from fresh persisted state.
-      const woke = await retryAfterCooldownWait({ triedSources })
+      const woke = await retryAfterCooldownWait({
+        triedSources,
+        signal: request.signal ?? undefined,
+      })
       if (!woke) continue // recompute the earliest bench and sleep again
       servingSource = woke.account.source
       triedSources.add(servingSource)

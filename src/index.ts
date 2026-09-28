@@ -34,6 +34,7 @@ import {
   removeToken,
   tokenFingerprint,
   validateTokenInput,
+  getTokenStorePath,
 } from "./token-store.ts"
 
 export * from "./betas.ts"

@@ -14,6 +14,12 @@ wrapper into OpenCode 2's `http.request` / `http.response` hooks.
 * skip a sticky account found benched by a concurrent request before sending anything, including at session startup.
 * remove a stored token via `/connect` ("Remove a stored Claude token").
 
+### Hardening (ported from the fork's quota-continuation work)
+
+* rotation/wake probes evaluate candidates without moving the shared active account until credentials are proven, so concurrent requests cannot destabilise each other.
+* quota-wait sleeps wake early when local state changes (a sibling cleared or extended a bench, a token was added), via filesystem watches on the rotation/token stores.
+* cooldown writes use exclusive temp-file creation; refresh-lock handoff races are fixed upstream of this port.
+
 ### Bug Fixes
 
 * redact `sk-ant-*` values in the debug log. Only JWT-shaped values and three specific keys were redacted before, so a `sk-ant-oat…` or `sk-ant-api…` value logged under another key could reach a file the README describes as safe to attach to an issue.
@@ -42,6 +48,8 @@ wrapper into OpenCode 2's `http.request` / `http.response` hooks.
 
 * update Claude Code version to 2.1.280 for Opus 5.5 ([#285](https://github.com/griffinmartin/opencode-claude-auth/issues/285)) ([662ee99](https://github.com/griffinmartin/opencode-claude-auth/commit/662ee99d3ace0aa7123e8ca6b4fc0e1ff4fd48e8))
 
+
+>>>>>>> 9af1182 (feat: harden automatic Claude quota continuation)
 ## [2.2.0](https://github.com/griffinmartin/opencode-claude-auth/compare/v2.1.6...v2.2.0) (2026-09-01)
 
 
