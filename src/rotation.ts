@@ -35,6 +35,7 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import type { ClaudeAccount } from "./keychain.ts"
 import { log } from "./logger.ts"
+import { acquireRefreshLock } from "./refresh-lock.ts"
 
 export interface CooldownEntry {
   /** Epoch ms until which this source is benched. */
@@ -193,14 +194,16 @@ export function readRotationState(): RotationStateFile {
 
 export function writeRotationState(state: RotationStateFile): boolean {
   const path = getRotationStatePath()
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`
+  let created = false
   try {
     const dir = dirname(path)
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 })
     // Exclusive creation for the same reason as the token store: the path is
     // env-configurable, and a plain write would follow a symlink pre-created by
     // another local user and clobber whatever it points at.
-    const tmp = `${path}.${process.pid}.tmp`
     const fd = openSync(tmp, "wx", 0o600)
+    created = true
     try {
       writeFileSync(fd, `${JSON.stringify(state, null, 2)}\n`, "utf-8")
     } finally {
@@ -214,7 +217,42 @@ export function writeRotationState(state: RotationStateFile): boolean {
       error: err instanceof Error ? err.message : String(err),
     })
     return false
+  } finally {
+    if (created) {
+      try {
+        unlinkSync(tmp)
+      } catch {
+        /* normally consumed by rename */
+      }
+    }
   }
+}
+
+/** Atomic rename protects readers, but does not serialize read/modify/write.
+ * Keep quota mutations under one short cross-process lock so a sibling's
+ * cooldown cannot be erased by a stale snapshot. There is no network or await
+ * while holding this lock. The existing lock helper provides stale recovery.
+ */
+const rotationLockSleep = new Int32Array(new SharedArrayBuffer(4))
+function mutateRotationState<T>(mutate: () => T): T {
+  const deadline = performance.now() + 6_000
+  do {
+    const lock = acquireRefreshLock("quota-rotation-state", {
+      dir: dirname(getRotationStatePath()),
+      ttlMs: 5_000,
+    })
+    if (lock) {
+      try {
+        return mutate()
+      } finally {
+        lock.release()
+      }
+    }
+    Atomics.wait(rotationLockSleep, 0, 0, 5)
+  } while (performance.now() < deadline)
+  // Rotation is a cache; an unusable filesystem must not wedge a request.
+  log("rotation_state_lock_timeout", {})
+  return mutate()
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +484,18 @@ export function markRateLimited(
   now = Date.now(),
   rng: () => number = Math.random,
 ): number {
+  return mutateRotationState(() =>
+    markRateLimitedLocked(source, cooldownMs, reason, now, rng),
+  )
+}
+
+function markRateLimitedLocked(
+  source: string,
+  cooldownMs: number,
+  reason: string,
+  now: number,
+  rng: () => number,
+): number {
   const state = readRotationState()
   const existing = state.cooldowns[source]
 
@@ -483,11 +533,13 @@ export function markRateLimited(
 }
 
 export function clearCooldown(source: string, now = Date.now()): void {
-  const state = readRotationState()
-  if (!state.cooldowns[source]) return
-  delete state.cooldowns[source]
-  writeRotationState(state)
-  log("rotation_cooldown_cleared", { source, at: now })
+  mutateRotationState(() => {
+    const state = readRotationState()
+    if (!state.cooldowns[source]) return
+    delete state.cooldowns[source]
+    writeRotationState(state)
+    log("rotation_cooldown_cleared", { source, at: now })
+  })
 }
 
 export function getCooldownUntil(

@@ -721,15 +721,21 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
 
     setTimeout(() => controller.abort(), 50)
     const started = Date.now()
-    const res = await helpers.fetchWithRetry(
-      "https://example.com",
-      { signal: controller.signal },
-      3,
-      mockFetch as unknown as typeof fetch,
-    )
+    const settled = await helpers
+      .fetchWithRetry(
+        "https://example.com",
+        { signal: controller.signal },
+        3,
+        mockFetch as unknown as typeof fetch,
+      )
+      .then(
+        () => ({ ok: true as const, status: 0 }),
+        (err) => ({ ok: false as const, error: err as Error }),
+      )
     const elapsed = Date.now() - started
 
-    assert.equal(res.status, 429)
+    assert.equal(settled.ok, false, "abort must reject, not surface the 429")
+    if (!settled.ok) assert.equal(settled.error.name, "AbortError")
     assert.equal(calls, 1, "must not keep retrying after abort")
     assert.ok(elapsed < 1_000, `expected a prompt return, took ${elapsed}ms`)
   })

@@ -157,15 +157,48 @@ Environment tokens take priority over stored ones and are never written to disk,
 
 When a request comes back rate-limited, the plugin benches that account and retries on the next healthy one — within the same request, so you usually just see a toast rather than an error.
 
-- **Order is fixed priority**, not round-robin: it always uses the highest-priority account that isn't benched, so your preferred subscription stays the default. Override the order with `OPENCODE_CLAUDE_AUTH_ACCOUNT_ORDER`.
+- **Selection is sticky**, not round-robin: a healthy active account stays selected. Failover uses priority order among eligible accounts. Override that order with `OPENCODE_CLAUDE_AUTH_ACCOUNT_ORDER`.
 - **Benches are remembered across restarts** (`~/.local/share/opencode/claude-auth-rotation.json`), so restarting OpenCode during a usage limit doesn't put you back on the exhausted account.
 - **How long depends on what the API says.** A `retry-after` or `anthropic-ratelimit-unified-*-reset` header sets the bench; an unexplained 429 gets a short 60s bench instead, so a transient blip doesn't write an account off for hours. Benches are capped at 6h.
 - **A bench clears as soon as the account works again**, so an early reset doesn't leave it sitting out.
 - **Long-context 429s don't rotate.** That error is about request headers, not your allowance, and every account shares it — it's handled by the existing beta-flag retry instead.
 
-The account picker in `opencode auth login` shows which accounts are benched and for how long. A bench is only a preference: picking a benched account explicitly still uses it.
+The account picker in `opencode auth login` shows which accounts are benched and for how long. A request skips a benched sticky account when another account is eligible.
 
-When every account is rate-limited, the real 429 is returned and the toast tells you what's benched and for how long.
+When every account is rate-limited, the plugin holds the request until the earliest recorded cooldown expires (plus a safety margin and jitter), then re-evaluates the pool and retries. Local changes to the roster or cooldowns trigger immediate re-evaluation. Progress ticks preserve the planned deadline and do not consume additional wait cycles. Concurrent processes serialize cooldown updates; each waiting request owns its own countdown file.
+
+Caller cancellation stops the wait. If OpenCode's **response-header deadline** expires during a quota wait, the plugin returns a deferred 429 with `retry-after` computed from the earliest cooldown, allowing OpenCode's retry scheduler to continue. For uninterrupted long waits, merge `"headerTimeout": false` and `"timeout": false` into `provider.anthropic.options` and restart OpenCode. Actual network attempts still have their own header deadline (`OPENCODE_CLAUDE_AUTH_NETWORK_TIMEOUT_MS`, default 120 seconds).
+
+`OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_MAX_CYCLES` limits wait/replanning cycles and `OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_MAX_MS` limits cumulative sleep. Both default to unlimited. `OPENCODE_CLAUDE_AUTH_ROTATE_WAIT=0` disables waiting.
+
+### Regression and sandbox tests
+
+```bash
+npm run test:node18
+npm run build
+node scripts/e2e-notouch.mjs --scenario concurrent
+node scripts/e2e-notouch.mjs --scenario stop
+node scripts/e2e-notouch.mjs --scenario deadline
+node scripts/e2e-notouch.mjs --scenario long
+```
+
+The sandbox scenarios start their own OpenCode server, use an isolated HOME/config/cache and mock tokens, and route plugin HTTP requests exclusively to a loopback stub. `long` takes roughly six minutes and asserts that automatic completion crosses the actual 300-second boundary. `deadline` shortens OpenCode's header deadline to exercise native retry. Successful runs remove their sandbox; failures print its path for inspection. Set `OPENCODE_BIN` to use a particular OpenCode binary.
+
+### Seeing the real next-attempt countdown
+
+`node scripts/quota-watch.mjs --watch` shows persisted account cooldowns and any plugin-held waits. To also see **OpenCode's native session retry schedule**, including the gap between HTTP attempts:
+
+```bash
+node scripts/quota-watch.mjs --watch \
+  --server http://127.0.0.1:PORT \
+  --session SESSION_ID \
+  --directory /path/to/project \
+  --time-zone Europe/Prague
+```
+
+The display ticks locally every second and refreshes OpenCode's read-only `/session/status` endpoint every 15 seconds. It makes no Anthropic requests and never sends credentials. A missing plugin-wait file does **not** imply a stopped session: OpenCode may be waiting on its own `retry.next` deadline. Account eligibility and a scheduled retry are displayed separately.
+
+Plugin progress notifications use OpenCode's `tui.showToast`. Paseo's current OpenCode adapter does not forward those to its chat panel, and it forwards the native retry message without the `next` timestamp. Therefore the watcher provides a terminal countdown; displaying it inline in Paseo chat requires a separate adapter/UI change.
 
 To turn rotation off and keep manual switching only:
 

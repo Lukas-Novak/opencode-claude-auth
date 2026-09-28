@@ -32,7 +32,7 @@ import {
   pickNextAccount,
 } from "./rotation.ts"
 import { resetExcludedBetas } from "./betas.ts"
-import { fetchWithRetry } from "./http.ts"
+import { fetchWithRetry, throwIfAborted } from "./http.ts"
 import { log } from "./logger.ts"
 import {
   classifyRefreshFailure,
@@ -1293,25 +1293,23 @@ export async function rotateAfterRateLimit(options: {
   // this session started is a legitimate rotation target, and discovering it
   // only on restart would be the difference between recovering and stalling.
   const roster = refreshAccountsList()
-  const previousSource = activeAccountSource
 
   // Walk candidates until one can actually serve a request. A candidate that
   // cannot produce credentials must not be left active, let alone persisted:
   // doing so strands this session — and every later one, via the state file —
   // on a broken account, which is strictly worse than the rate limit that
-  // triggered the rotation.
+  // triggered the rotation. Probing is scoped per candidate instead.
   let next: ClaudeAccount | null
   let credentials: ClaudeCredentials | null = null
   while ((next = pickNextAccount(roster, tried, now, config))) {
     tried.add(next.source)
 
-    // Must be active before asking: getCachedCredentials resolves the active
-    // account. Restored below if this candidate turns out to be unusable.
-    setActiveAccountSource(next.source)
-
-    // Through the normal path, so an OAuth account gets refreshed if its stored
-    // token went cold while benched. A static token short-circuits.
-    credentials = await getCachedCredentials()
+    // Evaluated directly for THIS candidate — the shared active pointer is only
+    // moved once credentials are proven working, so concurrent requests cannot
+    // destabilise each other through probe-time active switches. Through the
+    // normal path, so an OAuth account gets refreshed if its stored token went
+    // cold while benched. A static token short-circuits.
+    credentials = await getCachedCredentials(next)
     if (credentials) break
 
     log("rotation_target_unusable", {
@@ -1321,7 +1319,6 @@ export async function rotateAfterRateLimit(options: {
   }
 
   if (!next || !credentials) {
-    if (previousSource) setActiveAccountSource(previousSource)
     log("rotation_no_candidate", {
       limitedSource: options.limitedSource,
       poolSize: roster.length,
@@ -1331,6 +1328,7 @@ export async function rotateAfterRateLimit(options: {
   }
 
   // Persisted only now that the target is known to work.
+  setActiveAccountSource(next.source)
   saveAccountSource(next.source)
 
   log("rotation_switched", {
@@ -1360,7 +1358,10 @@ export async function rotateAfterRateLimit(options: {
 export async function retryAfterCooldownWait(options: {
   triedSources: Set<string>
   now?: number
+  invalidSources?: Set<string>
+  signal?: AbortSignal | null
 }): Promise<{ account: ClaudeAccount; credentials: ClaudeCredentials } | null> {
+  throwIfAborted(options.signal)
   const config = getRotationConfig()
   if (!config.enabled) return null
 
@@ -1376,24 +1377,27 @@ export async function retryAfterCooldownWait(options: {
   // Re-read the roster first, same as rotateAfterRateLimit: accounts added
   // in another window while we slept are legitimate wake targets.
   const roster = refreshAccountsList()
-  const previousSource = activeAccountSource
+  const invalid = options.invalidSources ?? new Set<string>()
+  const excluded = new Set([...options.triedSources, ...invalid])
 
   let next: ClaudeAccount | null
   let credentials: ClaudeCredentials | null = null
-  while ((next = pickNextAccount(roster, options.triedSources, now, config))) {
+  while ((next = pickNextAccount(roster, excluded, now, config))) {
     options.triedSources.add(next.source)
+    excluded.add(next.source)
 
-    // Must be active before asking: getCachedCredentials resolves the active
-    // account. Restored below if this candidate turns out to be unusable.
-    setActiveAccountSource(next.source)
-    credentials = await getCachedCredentials()
+    // Evaluated directly for THIS candidate — same scoped-probe contract as
+    // rotateAfterRateLimit.
+    credentials = await getCachedCredentials(next)
+    throwIfAborted(options.signal)
     if (credentials) break
+
+    invalid.add(next.source)
 
     log("rotation_wake_target_unusable", { target: next.source })
   }
 
   if (!next || !credentials) {
-    if (previousSource) setActiveAccountSource(previousSource)
     log("rotation_wake_no_candidate", {
       poolSize: roster.length,
       tried: options.triedSources.size,
@@ -1402,6 +1406,7 @@ export async function retryAfterCooldownWait(options: {
   }
 
   // Persisted only now that the target is known to work.
+  setActiveAccountSource(next.source)
   saveAccountSource(next.source)
 
   log("rotation_wake_switched", { to: next.source })

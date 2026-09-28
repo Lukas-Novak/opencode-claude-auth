@@ -3,7 +3,13 @@ import crypto from "node:crypto"
 import { config } from "./model-config.ts"
 import { readAllClaudeAccounts, type ClaudeAccount } from "./keychain.ts"
 import { initLogger, log } from "./logger.ts"
-import { fetchWithRetry, sleepUnlessAborted } from "./http.ts"
+import {
+  fetchClaudeMessages as fetchWithRetry,
+  isSyntheticDeadlineAbort,
+  sleepUntilStateChange,
+  stateRevision,
+  throwIfAborted,
+} from "./http.ts"
 import {
   addExcludedBeta,
   getExcludedBetas,
@@ -31,7 +37,6 @@ import {
   saveAccountSource,
   refreshAccountsList,
   refreshIfNeeded,
-  rotateAfterRateLimit,
   retryAfterCooldownWait,
   noteAccountSucceeded,
   chooseInitialAccount,
@@ -41,12 +46,15 @@ import {
   activeCooldowns,
   clearWaitAttempt,
   createWaitAttemptId,
-  earliestCooldown,
   formatRemaining,
   getCooldownUntil,
   getRotationConfig,
   getRotationWaitConfig,
   publishWaitAttempt,
+  readRotationState,
+  getRotationStatePath,
+  cooldownFromResponse,
+  markRateLimited,
 } from "./rotation.ts"
 import {
   addTokens,
@@ -56,6 +64,7 @@ import {
   removeToken,
   tokenFingerprint,
   validateTokenInput,
+  getTokenStorePath,
 } from "./token-store.ts"
 
 export {
@@ -231,15 +240,6 @@ function notify(
   }
 }
 
-/** One-line summary of which accounts are benched, for warnings. */
-function describeCooldowns(now = Date.now()): string {
-  const cooling = activeCooldowns(now)
-  if (cooling.length === 0) return "No cooldowns are recorded."
-  return cooling
-    .map((c) => `${c.source} for ${formatRemaining(c.remainingMs)}`)
-    .join(", ")
-}
-
 /**
  * Clock, sleeper, and entropy source for the quota-wait loop, behind a seam
  * so tests can travel time instead of napping. Production always runs on the
@@ -247,13 +247,26 @@ function describeCooldowns(now = Date.now()): string {
  */
 type RotationWaitDeps = {
   now: () => number
-  sleep: (ms: number, signal?: AbortSignal | null) => Promise<void>
+  sleep: (
+    ms: number,
+    signal?: AbortSignal | null,
+    revision?: string,
+  ) => Promise<void>
   rng: () => number
 }
 
+const availabilityPaths = () => [getRotationStatePath(), getTokenStorePath()]
+const availabilitySleep: RotationWaitDeps["sleep"] = (ms, signal, revision) =>
+  sleepUntilStateChange(
+    Math.min(ms, 60_000),
+    signal,
+    availabilityPaths(),
+    revision,
+  )
+
 let rotationWaitDeps: RotationWaitDeps = {
   now: () => Date.now(),
-  sleep: sleepUnlessAborted,
+  sleep: availabilitySleep,
   rng: () => Math.random(),
 }
 
@@ -263,8 +276,234 @@ export function __setRotationWaitDepsForTests(
 ): void {
   rotationWaitDeps = {
     now: deps?.now ?? (() => Date.now()),
-    sleep: deps?.sleep ?? sleepUnlessAborted,
+    sleep: deps?.sleep ?? availabilitySleep,
     rng: deps?.rng ?? (() => Math.random()),
+  }
+}
+
+type AvailabilityContext = {
+  cycles: number
+  elapsedMs: number
+  invalid: Set<string>
+  signal?: AbortSignal | null
+  lastEarliestUntil?: number
+  lastEarliestLabel?: string
+}
+
+type AcquireResult =
+  | { account: ClaudeAccount; credentials: ClaudeCredentials }
+  | { deferredToOpenCodeRetry: true }
+  | null
+
+function isDeferred(
+  result: unknown,
+): result is { deferredToOpenCodeRetry: true } {
+  return (
+    typeof result === "object" &&
+    result !== null &&
+    (result as { deferredToOpenCodeRetry?: unknown })
+      .deferredToOpenCodeRetry === true
+  )
+}
+
+/**
+ * Answer a client-side 429 with an *authoritative* retry-after derived from our
+ * own persisted earliest-bench (never the possibly stale header of whichever
+ * account happened to 429 first). OpenCode's retry machinery then resumes at
+ * the benchmark time, and on that retry the request goes through immediately.
+ */
+function deferred429(context: AvailabilityContext): Response {
+  const until = context.lastEarliestUntil ?? rotationWaitDeps.now() + 30_000
+  const seconds = Math.max(
+    1,
+    Math.ceil((until - rotationWaitDeps.now()) / 1000),
+  )
+  return new Response(
+    JSON.stringify({
+      type: "error",
+      error: {
+        type: "rate_limit_error",
+        message: `Claude quota: ${seconds}s until next eligible account${context.lastEarliestLabel ? ` (${context.lastEarliestLabel})` : ""}; OpenCode will retry automatically.`,
+      },
+    }),
+    {
+      status: 429,
+      headers: {
+        "content-type": "application/json",
+        "retry-after": String(seconds),
+      },
+    },
+  )
+}
+
+/** The sole owner of quota waiting. File events wake it early; timer ticks
+ * re-read local state only. HTTP is attempted only after a candidate is eligible.
+ * It never re-benches a stale response while waiting; OpenCode's own wrapper
+ * abort converts to a benchmark-accurate deferred retry, never a cached 429
+ * and never a fake cancellation. The caller's signal stays honest for Stop. */
+async function acquireAvailableAccount(
+  context: AvailabilityContext,
+  client?: ToastClient,
+): Promise<AcquireResult> {
+  const options = getRotationWaitConfig()
+  const id = createWaitAttemptId()
+  let startedAt: number | undefined
+  let nextProgressAt = 0
+  try {
+    for (;;) {
+      throwIfAborted(context.signal)
+      const revision = stateRevision(availabilityPaths())
+      const now = rotationWaitDeps.now()
+      const roster = refreshAccountsList()
+      const state = readRotationState()
+      const usable = roster.filter(
+        (account) => !context.invalid.has(account.source),
+      )
+      if (
+        usable.some(
+          (account) => !(state.cooldowns[account.source]?.until > now),
+        )
+      ) {
+        const candidate = await retryAfterCooldownWait({
+          triedSources: new Set(),
+          invalidSources: context.invalid,
+          signal: context.signal,
+          now,
+        })
+        throwIfAborted(context.signal)
+        if (candidate) {
+          if (startedAt !== undefined)
+            log("rotation_wait_wake", {
+              source: candidate.account.source,
+              cycle: context.cycles,
+            })
+          return candidate
+        }
+        continue // failed candidates were excluded, not given imaginary cooldowns
+      }
+      const limited = usable
+        .map((account) => ({ account, entry: state.cooldowns[account.source] }))
+        .filter((item) => item.entry?.until > now)
+        .sort((a, b) => a.entry.until - b.entry.until)
+      const earliest = limited[0]
+      context.lastEarliestUntil = earliest?.entry?.until
+      context.lastEarliestLabel = earliest?.account.label
+      if (!earliest) return null
+      if (!options.enabled) return null
+      if (options.maxCycles > 0 && context.cycles >= options.maxCycles)
+        return null
+      if (startedAt === undefined) startedAt = now
+      context.cycles++
+
+      // Keep this deadline fixed across progress ticks: neither the safety
+      // margin nor the jitter should disappear or be redrawn on each tick.
+      const deadline =
+        earliest.entry.until +
+        options.marginMs +
+        Math.floor(rotationWaitDeps.rng() * options.jitterMs)
+      log("rotation_wait_start", {
+        cycle: context.cycles,
+        earliestSource: earliest.account.source,
+        earliestAt: earliest.entry.until,
+        waitMs: Math.max(0, deadline - now),
+      })
+      if (context.cycles === 1) {
+        notify(
+          client,
+          `Claude quota wait: next eligible account ${earliest.account.label} at ${new Date(deadline).toISOString()}; re-evaluating automatically.`,
+          "warning",
+        )
+        nextProgressAt = now + options.progressMs
+      }
+      const budgetLeft =
+        options.maxWaitTotalMs > 0
+          ? options.maxWaitTotalMs - context.elapsedMs
+          : Infinity
+      if (budgetLeft <= 0) return null
+      publishWaitAttempt(
+        id,
+        {
+          cycle: context.cycles,
+          startedAt,
+          plannedSource: earliest.account.source,
+          plannedLabel: earliest.account.label,
+          until: deadline,
+          waitMs: Math.max(0, deadline - now),
+        },
+        now,
+      )
+
+      const sleepDelta = async (ms: number): Promise<void> => {
+        const t0 = rotationWaitDeps.now()
+        try {
+          await rotationWaitDeps.sleep(ms, context.signal, revision)
+        } finally {
+          context.elapsedMs += Math.max(0, rotationWaitDeps.now() - t0)
+        }
+      }
+
+      for (;;) {
+        const tickAt = rotationWaitDeps.now()
+        const leftMs = deadline - tickAt
+        if (leftMs <= 0) break
+        const remainingBudget =
+          options.maxWaitTotalMs > 0
+            ? options.maxWaitTotalMs - context.elapsedMs
+            : Infinity
+        if (remainingBudget <= 0) return null
+        if (options.progressMs > 0 && tickAt >= nextProgressAt) {
+          publishWaitAttempt(
+            id,
+            {
+              cycle: context.cycles,
+              startedAt,
+              plannedSource: earliest.account.source,
+              plannedLabel: earliest.account.label,
+              until: deadline,
+              waitMs: leftMs,
+            },
+            tickAt,
+          )
+          notify(
+            client,
+            `Next attempt in ~${formatRemaining(leftMs)} via ${earliest.account.label}.`,
+            "info",
+          )
+          nextProgressAt = tickAt + options.progressMs
+        }
+        await sleepDelta(
+          Math.min(leftMs, options.progressMs || Infinity, remainingBudget),
+        )
+        throwIfAborted(context.signal)
+        // Re-plan immediately on a roster/bench change. Reusing the old
+        // revision in another watcher would otherwise cause a tight loop of
+        // already-changed revisions until the entire chunk count ran out.
+        if (stateRevision(availabilityPaths()) !== revision) break
+        // A frozen test clock (or a clock adjustment) must not bypass an
+        // explicit cycle cap. Real timers normally advance the wall clock.
+        if (rotationWaitDeps.now() <= tickAt) break
+      }
+    }
+  } catch (error) {
+    if (context.signal?.aborted && isSyntheticDeadlineAbort(context.signal)) {
+      // OpenCode's outer window (default 300 s) closed before the bench reset.
+      // That is not a user cancellation: hand the flow back so we can defer
+      // resumption to OpenCode's retry policy with an accurate retry-after,
+      // instead of killing this turn with an abort it cannot distinguish.
+      log("rotation_wait_outer_timeout", {
+        cycle: context.cycles,
+        elapsedMs: context.elapsedMs,
+      })
+      return { deferredToOpenCodeRetry: true }
+    }
+    if (context.signal?.aborted)
+      log("rotation_wait_aborted", {
+        cycle: context.cycles,
+        elapsedMs: context.elapsedMs,
+      })
+    throw error
+  } finally {
+    clearWaitAttempt(id)
   }
 }
 
@@ -432,27 +671,63 @@ const plugin: Plugin = async (pluginInput) => {
         return {
           apiKey: "",
           baseURL: "https://api.anthropic.com/v1",
+          // OpenCode's header deadline wraps this entire fetch, including the
+          // quota sleep. Actual network attempts have their own deadline below.
+          ...(getRotationConfig().enabled && getRotationWaitConfig().enabled
+            ? { headerTimeout: false, timeout: false }
+            : {}),
           async fetch(input: RequestInfo | URL, init?: RequestInit) {
-            const requestInit = init ?? {}
+            const requestInit = {
+              ...init,
+              signal:
+                init?.signal ??
+                (input instanceof Request ? input.signal : undefined),
+            }
+            throwIfAborted(requestInit.signal)
+            const availability: AvailabilityContext = {
+              cycles: 0,
+              elapsedMs: 0,
+              invalid: new Set(),
+              signal: requestInit.signal,
+            }
+            let selectedAccount = getActiveAccount()
             // The sticky source may have been benched by another concurrent
             // request. Skip it before sending anything if a healthy source is
             // already available — no unnecessary 429 just to trigger rotation.
             if (
               getRotationConfig().enabled &&
-              getActiveAccount() &&
-              getCooldownUntil(getActiveAccount()!.source) !== null
+              selectedAccount &&
+              getCooldownUntil(
+                selectedAccount.source,
+                rotationWaitDeps.now(),
+              ) !== null
             ) {
-              const eligible = await retryAfterCooldownWait({
-                triedSources: new Set<string>(),
-              })
-              if (eligible) syncAuthJson(eligible.credentials)
+              const eligible = await acquireAvailableAccount(
+                availability,
+                toastClient,
+              )
+              if (isDeferred(eligible)) {
+                log("rotation_deferred_retry", {
+                  phase: "preflight",
+                  deferredAt: availability.lastEarliestUntil,
+                })
+                return deferred429(availability)
+              }
+              if (eligible) {
+                selectedAccount = eligible.account
+                syncAuthJson(eligible.credentials)
+              } else if (getRotationWaitConfig().enabled) {
+                throw new Error(
+                  "Claude quota wait budget exhausted or no usable accounts remain.",
+                )
+              }
             }
             // Account selection is shared process state; another concurrent
             // turn can switch it during our HTTP call. Attribute this request's
             // response to the source whose token it actually sent.
-            const selectedAccount = getActiveAccount()
             let servingSource = selectedAccount?.source ?? null
             let latest = await getCachedCredentials(selectedAccount)
+            throwIfAborted(requestInit.signal)
             if (!latest) {
               // A transient refresh rate-limit must not surface as a hard error.
               // Wait (bounded, abort-aware) for our cooldown to clear or for a
@@ -739,288 +1014,84 @@ const plugin: Plugin = async (pluginInput) => {
             // bound or disable the waiting for callers that prefer to fail.
             if (response.status === 429 && getRotationConfig().enabled) {
               const rotationConfig = getRotationConfig()
-              const waitConfig = getRotationWaitConfig()
-              const triedSources = new Set<string>()
-              if (servingSource) triedSources.add(servingSource)
+              let switches = 0
+              while (response.status === 429) {
+                throwIfAborted(requestInit.signal)
 
-              // Human labels for toasts, seeded from the startup roster and
-              // extended whenever rotation picks an account — the wait
-              // messages can then name accounts without a credential rescan.
-              const labels = new Map(accounts.map((a) => [a.source, a.label]))
-
-              let waitCycles = 0
-              let waitedMs = 0
-              let waitToastShown = false
-              const startedAtForRequest = rotationWaitDeps.now()
-              const waitId = createWaitAttemptId()
-
-              const giveUp = (): void => {
-                clearWaitAttempt(waitId)
-                // Return the 429 so the user sees the real limit rather than
-                // a silent stall, and say which accounts are benched and for
-                // how long — that is the one piece of information the raw API
-                // error cannot carry.
-                notify(
-                  toastClient,
-                  `All Claude accounts are rate-limited. ${describeCooldowns(rotationWaitDeps.now())}`,
-                  "error",
-                )
-              }
-
-              rotation: for (;;) {
-                let outOfCandidates = false
-
-                for (
-                  let switchCount = 0;
-                  switchCount < rotationConfig.maxSwitchesPerRequest;
-                  switchCount++
-                ) {
-                  if (response.status !== 429) break
-
-                  // Body is needed both to exclude long-context errors and to
-                  // tell an explained usage limit from a bare 429. Cloned so
-                  // the response stays readable if we end up returning it.
-                  let limitBody = ""
-                  try {
-                    limitBody = await response.clone().text()
-                  } catch {
-                    // An unreadable body is not a reason to skip rotation; it
-                    // only costs the body-derived reason label.
-                  }
-
-                  if (isLongContextError(limitBody)) {
-                    log("rotation_skipped_long_context", { modelId })
-                    break rotation
-                  }
-
-                  const limitedSource = servingSource
-                  if (!limitedSource) break rotation
-
-                  const rotated = await rotateAfterRateLimit({
-                    limitedSource,
-                    headers: response.headers,
-                    body: limitBody,
-                    triedSources,
-                    now: rotationWaitDeps.now(),
-                  })
-                  if (!rotated) {
-                    outOfCandidates = true
-                    break
-                  }
-
-                  triedSources.add(rotated.account.source)
-                  servingSource = rotated.account.source
-                  labels.set(rotated.account.source, rotated.account.label)
-                  tokenInUse = rotated.credentials.accessToken
-                  syncAuthJson(rotated.credentials)
-                  notify(
-                    toastClient,
-                    `Rate limit reached — switched to ${rotated.account.label}.`,
-                    "warning",
-                  )
-
-                  response = await fetchWithRetry(requestUrl, {
-                    ...requestInit,
-                    body,
-                    headers: buildRequestHeaders(
-                      input,
-                      requestInit,
-                      tokenInUse,
-                      modelId,
-                      getExcludedBetas(modelId),
-                    ),
-                  })
-                  log("rotation_retry_response", {
-                    modelId,
-                    source: rotated.account.source,
-                    status: response.status,
-                    switchCount: switchCount + 1,
-                  })
+                // Body is needed both to exclude long-context errors and to
+                // tell an explained usage limit from a bare 429. Cloned so
+                // the response stays readable if we end up returning it.
+                let limitBody = ""
+                try {
+                  limitBody = await response.clone().text()
+                } catch {
+                  // An unreadable body is not a reason to skip rotation; it
+                  // only costs the body-derived reason label.
                 }
 
-                if (response.status !== 429) break
-                if (!outOfCandidates) {
-                  // The switch budget ran out while a later account could
-                  // still serve the request — that is a call-count bound, not
-                  // a depleted pool, so sleeping here would be self-imposed.
-                  giveUp()
+                if (isLongContextError(limitBody)) {
+                  log("rotation_skipped_long_context", { modelId })
                   break
                 }
 
-                // ----- all accounts benched, tried, or broken: the wait -----
-                if (!waitConfig.enabled) {
-                  giveUp()
-                  break
-                }
+                const limitedSource = servingSource
+                if (!limitedSource) break
 
-                const earliest = earliestCooldown(rotationWaitDeps.now())
-                if (!earliest) {
-                  // No live bench means every candidate failed credential
-                  // validation rather than a quota check — a broken account
-                  // must not manufacture a quota wait out of nothing.
-                  giveUp()
-                  break
-                }
-                if (
-                  waitConfig.maxCycles > 0 &&
-                  waitCycles >= waitConfig.maxCycles
-                ) {
-                  log("rotation_wait_budget_exceeded", {
-                    modelId,
-                    budget: "cycles",
-                    maxCycles: waitConfig.maxCycles,
-                    waitedMs,
-                  })
-                  giveUp()
-                  break
-                }
-
-                const wakeTarget =
-                  earliest.until - rotationWaitDeps.now() + waitConfig.marginMs
-                let waitMs = Math.max(0, wakeTarget)
-                waitMs += Math.floor(
-                  rotationWaitDeps.rng() * waitConfig.jitterMs,
-                )
-
-                if (
-                  waitConfig.maxWaitTotalMs > 0 &&
-                  waitedMs + waitMs > waitConfig.maxWaitTotalMs
-                ) {
-                  log("rotation_wait_budget_exceeded", {
-                    modelId,
-                    budget: "total_ms",
-                    maxWaitTotalMs: waitConfig.maxWaitTotalMs,
-                    waitedMs,
-                  })
-                  giveUp()
-                  break
-                }
-
-                waitCycles += 1
-                waitedMs += waitMs
-                const earliestLabel =
-                  labels.get(earliest.source) ?? earliest.source
-                if (!waitToastShown) {
-                  waitToastShown = true
-                  notify(
-                    toastClient,
-                    `All ${refreshAccountsList().length} Claude accounts are rate-limited. Next availability: ${earliestLabel} in ${formatRemaining(waitMs)} — the request resumes automatically.`,
-                    "error",
-                  )
-                }
-                log("rotation_wait_start", {
-                  modelId,
-                  cycle: waitCycles,
-                  earliestSource: earliest.source,
-                  earliestAt: earliest.until,
-                  earliestReason: earliest.reason,
-                  waitMs,
-                  remaining: describeCooldowns(rotationWaitDeps.now()),
-                })
-
-                const waitSignal = requestInit.signal ?? undefined
-                // Publish the wait so quota-watch can show a live countdown.
-                // Refreshed at
-                // every chunk boundary; deleted on end/abort/give-up, so a
-                // lingering stale entry only ever means "the holding request
-                // died", never "a retry is secretly coming".
-                const sleepStartedAt = rotationWaitDeps.now()
-                const wakeDeadline = sleepStartedAt + waitMs
-                publishWaitAttempt(
-                  waitId,
-                  {
-                    cycle: waitCycles,
-                    startedAt: startedAtForRequest,
-                    plannedSource: earliest.source,
-                    plannedLabel: earliestLabel,
-                    until: wakeDeadline,
-                    waitMs,
-                  },
+                const { ms, reason } = cooldownFromResponse(
+                  response.headers,
+                  limitBody,
+                  rotationConfig,
                   rotationWaitDeps.now(),
                 )
-
-                const progressMs = waitConfig.progressMs
-                let aborted = false
-                try {
-                  for (;;) {
-                    const nowInner = rotationWaitDeps.now()
-                    const remainingMs = wakeDeadline - nowInner
-                    if (remainingMs <= 0) break
-                    const chunkMs =
-                      progressMs > 0
-                        ? Math.min(progressMs, remainingMs)
-                        : remainingMs
-                    await rotationWaitDeps.sleep(chunkMs, waitSignal)
-                    if (waitSignal?.aborted) {
-                      aborted = true
-                      break
-                    }
-                    // Preserve the single-shot behaviour with progress off,
-                    // including an injected sleeper whose clock doesn't move.
-                    if (progressMs <= 0) break
-                    const leftMs = wakeDeadline - rotationWaitDeps.now()
-                    if (leftMs <= 0) break
-                    publishWaitAttempt(
-                      waitId,
-                      {
-                        cycle: waitCycles,
-                        startedAt: startedAtForRequest,
-                        plannedSource: earliest.source,
-                        plannedLabel: earliestLabel,
-                        until: wakeDeadline,
-                        waitMs: leftMs,
-                      },
-                      rotationWaitDeps.now(),
-                    )
-                    notify(
-                      toastClient,
-                      `Next attempt in ~${formatRemaining(leftMs)} via ${earliestLabel}.`,
-                      "info",
-                    )
-                  }
-                } finally {
-                  clearWaitAttempt(waitId)
-                }
-                if (aborted) {
-                  // The turn was cancelled mid-wait: surface the limit we were
-                  // holding rather than firing one more request nobody reads.
-                  log("rotation_wait_aborted", {
+                markRateLimited(
+                  limitedSource,
+                  ms,
+                  reason,
+                  rotationWaitDeps.now(),
+                )
+                // Automatic mode must visit every configured account. The
+                // legacy switch cap remains only for explicit fail-fast mode.
+                if (
+                  !getRotationWaitConfig().enabled &&
+                  switches >= rotationConfig.maxSwitchesPerRequest
+                )
+                  break
+                const rotated = await acquireAvailableAccount(
+                  availability,
+                  toastClient,
+                )
+                if (isDeferred(rotated)) {
+                  // OpenCode's wrapper aborted mid-sleep at its own deadline:
+                  // answer with an authoritative retry-after so its retry
+                  // machinery resumes exactly when the bench becomes eligible.
+                  void response.body?.cancel().catch(() => {})
+                  response = deferred429(availability)
+                  switches++
+                  log("rotation_deferred_retry", {
                     modelId,
-                    cycle: waitCycles,
-                    waitedMs,
+                    limitedSource,
+                    deferredAt: availability.lastEarliestUntil,
+                    remainingMs: availability.lastEarliestUntil
+                      ? Math.max(
+                          0,
+                          availability.lastEarliestUntil -
+                            rotationWaitDeps.now(),
+                        )
+                      : null,
                   })
                   break
                 }
-                log("rotation_wait_wake", {
-                  modelId,
-                  cycle: waitCycles,
-                  plannedSource: earliest.source,
-                })
+                throwIfAborted(requestInit.signal)
+                if (!rotated) break
+                void response.body?.cancel().catch(() => {})
 
-                // Never assume the planned account is healthy: benches may
-                // have been extended or cleared by sibling instances while we
-                // slept, so selection starts from fresh persisted state.
-                const woke = await retryAfterCooldownWait({
-                  triedSources,
-                  now: rotationWaitDeps.now(),
-                })
-                if (!woke) {
-                  // State did not open up (a sibling extended the benches, or
-                  // the candidates all failed validation). Recompute the
-                  // earliest bench and sleep again — every pass through here
-                  // sleeps, so this loop can never spin.
-                  continue
-                }
-
-                triedSources.add(woke.account.source)
-                servingSource = woke.account.source
-                labels.set(woke.account.source, woke.account.label)
-                tokenInUse = woke.credentials.accessToken
-                syncAuthJson(woke.credentials)
+                servingSource = rotated.account.source
+                tokenInUse = rotated.credentials.accessToken
+                syncAuthJson(rotated.credentials)
                 notify(
                   toastClient,
-                  `Limits reset — continuing on ${woke.account.label}.`,
-                  "info",
+                  `Rate limit reached — switched to ${rotated.account.label}.`,
+                  "warning",
                 )
 
                 response = await fetchWithRetry(requestUrl, {
@@ -1034,12 +1105,12 @@ const plugin: Plugin = async (pluginInput) => {
                     getExcludedBetas(modelId),
                   ),
                 })
-                log("rotation_wake_retry_response", {
+                log("rotation_retry_response", {
                   modelId,
-                  source: woke.account.source,
+                  source: rotated.account.source,
                   status: response.status,
+                  switchCount: ++switches,
                 })
-                // Loop: re-evaluate the fresh response from the top.
               }
             }
 

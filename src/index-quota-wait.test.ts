@@ -1035,11 +1035,18 @@ describe("quota wait — integration", () => {
 
       const start = Date.now()
       controller.abort()
-      const response = await pending
-
+      // Cancellation now propagates as the platform abort, not as a fake held
+      // 429 that would desynchronise the AI SDK's own bookkeeping.
+      const settled = await pending.then(
+        () => {
+          throw new Error("expected abort")
+        },
+        (err) => err,
+      )
       assert.ok(Date.now() - start < 5_000, "abort must resolve promptly")
-      assert.equal(response.status, 429, "the held limit response surfaces")
+      assert.equal(settled?.name, "AbortError", "abort must reject cleanly")
       assert.equal(h.calls.length, 1, "no request fires after the abort")
+      assert.equal(readWaitAttempts().length, 0, "wait publication cleaned up")
     } finally {
       h.cleanup()
     }
@@ -1314,9 +1321,13 @@ describe("quota wait — integration", () => {
       )
 
       controller.abort()
-      const response = await pending
-
-      assert.equal(response.status, 429)
+      const settled = await pending.then(
+        () => {
+          throw new Error("expected abort")
+        },
+        (err) => err,
+      )
+      assert.equal(settled?.name, "AbortError")
       assert.equal(
         readWaitAttempts().length,
         0,
