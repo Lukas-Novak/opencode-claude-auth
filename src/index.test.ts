@@ -1,5 +1,22 @@
 import assert from "node:assert/strict"
+import { mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { describe, it } from "node:test"
+
+// Isolate account/rotation state so a test run can neither read the real
+// token pool (a fresh credential would be preferred over the fixture token)
+// nor bench a real account. Reads happen lazily per call, so setting these
+// here — after imports are hoisted — is still early enough.
+const stateTestDir = mkdtempSync(
+  join(tmpdir(), "opencode-claude-auth-statetest-"),
+)
+process.env.OPENCODE_CLAUDE_AUTH_ROTATION_FILE = join(
+  stateTestDir,
+  "rotation.json",
+)
+process.env.OPENCODE_CLAUDE_AUTH_TOKENS_FILE = join(stateTestDir, "tokens.json")
+process.env.CLAUDE_CONFIG_DIR = join(stateTestDir, "claude-config")
 import plugin, {
   IDENTITY_REQUEST_HOOKS,
   injectClaudeIdentity,

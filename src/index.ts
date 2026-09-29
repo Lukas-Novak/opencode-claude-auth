@@ -49,11 +49,11 @@ const SYSTEM_IDENTITY =
   "You are Claude Code, Anthropic's official CLI for Claude."
 
 /** Method id for pasted `claude setup-token` credentials (never refreshed). */
-export const TOKEN_METHOD_ID = Integration.MethodID.make("claude-setup-token")
+export const TOKEN_METHOD_ID: Integration.MethodID =
+  Integration.MethodID.make("claude-setup-token")
 /** Method id for the remove-a-stored-token flow. */
-export const REMOVE_TOKEN_METHOD_ID = Integration.MethodID.make(
-  "claude-token-remove",
-)
+export const REMOVE_TOKEN_METHOD_ID: Integration.MethodID =
+  Integration.MethodID.make("claude-token-remove")
 
 /**
  * Session request kinds that reach the model and are billed to the connected
@@ -418,7 +418,8 @@ export const ClaudeAuthPlugin = Plugin.define({
       const connection = await ctx.integration.connection.active(INTEGRATION_ID)
       if (!connection) return
       const credential = await ctx.integration.connection.resolve(connection)
-      if (!credential || !isPluginCredential(credential)) return
+      if (!credential || credential.type !== "oauth") return
+      if (!isPluginCredential(credential)) return
       const source =
         typeof credential.metadata?.source === "string"
           ? credential.metadata.source

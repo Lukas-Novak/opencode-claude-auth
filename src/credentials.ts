@@ -18,7 +18,6 @@ import {
   type ClaudeAccount,
   type ClaudeCredentials,
 } from "./keychain.ts"
-import { throwIfAborted } from "./http.ts"
 import { readStaticCredentials } from "./token-store.ts"
 import {
   clearCooldown,

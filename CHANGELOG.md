@@ -29,6 +29,7 @@ wrapper into OpenCode 2's `http.request` / `http.response` hooks.
 * rate-limit recovery rides OpenCode 2's native request hooks: rotation and quota waits happen inside the `http.response` hook instead of a replaced `fetch`. OpenCode enforces a per-attempt request timeout that will abort a long wait mid-sleep; the abort surfaces the 429, OpenCode retries on its own backoff, and the hook re-enters and keeps waiting, so long quota windows still resolve — just across several attempts instead of one unbroken sleep.
 * account-switch and quota progress go to the debug log and the quota-watch publication only; TUI toast notifications from the v1 fork are not ported (the hook has no TUI client).
 * the remove-token method's option list is built at startup; tokens added in the same session appear after a restart.
+* `src/index-quota-wait.test.ts` and `src/rotation-stress.test.ts` drove the v1 wrapper end-to-end and are parked as `*.legacy-test.ts` (out of the test glob) until they are re-expressed against the `http.response` hook. Engine suites (`rotation`, `rotation-process`, `http-lifecycle`, `credentials`, `provider`, `token-store`, `quota-watch`) run green.
 
 ## [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/compare/v2.2.1...v3.0.0) (2026-10-16)
 

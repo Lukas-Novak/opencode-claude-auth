@@ -20,8 +20,10 @@
  */
 import {
   chmodSync,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -427,6 +429,7 @@ export function markRateLimited(
   cooldownMs: number,
   reason: string,
   now = Date.now(),
+  rng: () => number = Math.random,
 ): number {
   return mutateRotationState(() =>
     markRateLimitedLocked(source, cooldownMs, reason, now, rng),
