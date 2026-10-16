@@ -19,6 +19,7 @@ import {
 import { resetExcludedBetas } from "./betas.ts"
 import { fetchWithRetry } from "./http.ts"
 import { log } from "./logger.ts"
+import { getUserAgent } from "./model-config.ts"
 import {
   classifyRefreshFailure,
   clearRefreshOutcome,
@@ -77,6 +78,17 @@ export function refreshAccountsList(): ClaudeAccount[] {
   }
   allAccounts = fresh
   return allAccounts
+}
+
+/**
+ * The account a specific credential belongs to. Callers holding a credential
+ * of their own must resolve through this rather than {@link getActiveAccount},
+ * whose answer is process-wide and only tracks the most recent `/connect`.
+ * Returns null once an account is gone from the store, so the caller falls
+ * back to what it was handed instead of another account's token.
+ */
+export function getAccountBySource(source: string): ClaudeAccount | null {
+  return allAccounts.find((account) => account.source === source) ?? null
 }
 
 export function getActiveAccount(): ClaudeAccount | null {
@@ -325,7 +337,11 @@ export async function refreshViaOAuthDetailed(
     log("refresh_started", { source: "oauth" })
     const response = await fetchWithRetry(OAUTH_TOKEN_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        // OpenCode's default User-Agent can trigger a 429 at the token endpoint.
+        "User-Agent": getUserAgent(),
+      },
       body: body.toString(),
       signal: controller.signal,
     })
@@ -561,6 +577,18 @@ export async function refreshIfNeeded(
   } finally {
     inFlightRefreshes.delete(target.source)
   }
+}
+
+/**
+ * Rotate the account's tokens now, however long they have left. Goes through
+ * refreshIfNeeded, so it joins an in-flight exchange and takes the
+ * cross-process lock: OpenCode's own refresh callback and the request path
+ * can't both spend the same refresh token.
+ */
+export function rotateAccountCredentials(
+  account: ClaudeAccount,
+): Promise<ClaudeCredentials | null> {
+  return refreshIfNeeded(account, Number.POSITIVE_INFINITY)
 }
 
 /**
@@ -959,8 +987,8 @@ export async function forceRefreshActiveAccount(
   refresh: (
     refreshToken: string,
   ) => Promise<ClaudeCredentials | null> = refreshViaOAuth,
+  account: ClaudeAccount | null = getActiveAccount(),
 ): Promise<ClaudeCredentials | null> {
-  const account = getActiveAccount()
   if (!account?.credentials.refreshToken) return null
 
   // These tokens belong to another account: exchanging them here would
@@ -1016,8 +1044,9 @@ export function invalidateCredentialCache(): void {
   }
 }
 
-export async function getCachedCredentials(): Promise<ClaudeCredentials | null> {
-  const account = getActiveAccount()
+export async function getCachedCredentials(
+  account: ClaudeAccount | null = getActiveAccount(),
+): Promise<ClaudeCredentials | null> {
   if (!account) return null
 
   const now = Date.now()
@@ -1094,11 +1123,12 @@ export interface CredentialWaitOptions {
  */
 export async function getCredentialsWithBackoff(
   opts: CredentialWaitOptions = {},
+  account: ClaudeAccount | null = getActiveAccount(),
 ): Promise<ClaudeCredentials | null> {
-  const first = await getCachedCredentials()
+  const first = await getCachedCredentials(account)
   if (first) return first
 
-  const source = getActiveAccount()?.source
+  const source = account?.source
   // No active account means no in-progress refresh could ever produce a token,
   // so waiting is pointless — fail fast instead of spinning the wait budget.
   if (!source) return null
@@ -1119,7 +1149,7 @@ export async function getCredentialsWithBackoff(
     // Jittered poll so sibling instances desynchronize their re-reads.
     await sleep(Math.round(pollMs * (0.5 + rng() * 0.5)), opts.signal)
     if (opts.signal?.aborted) return null
-    const creds = await getCachedCredentials()
+    const creds = await getCachedCredentials(account)
     if (creds) return creds
     if (source && getRefreshFailureKind(source) === "terminal") return null
   }
@@ -1132,8 +1162,10 @@ export async function getCredentialsWithBackoff(
  * deciding between a retryable response and a hard "re-authenticate" error.
  * An active cooldown implies a transient failure.
  */
-export function getActiveRefreshFailureKind(): RefreshFailureKind | null {
-  const source = getActiveAccount()?.source
+export function getActiveRefreshFailureKind(
+  account: ClaudeAccount | null = getActiveAccount(),
+): RefreshFailureKind | null {
+  const source = account?.source
   if (!source) return null
   const kind = getRefreshFailureKind(source)
   if (kind === "transient" || isRefreshCooldownActive(source))
@@ -1141,8 +1173,9 @@ export function getActiveRefreshFailureKind(): RefreshFailureKind | null {
   return kind
 }
 
-export function reloadCredentialsFromSource(): ClaudeCredentials | null {
-  const account = getActiveAccount()
+export function reloadCredentialsFromSource(
+  account: ClaudeAccount | null = getActiveAccount(),
+): ClaudeCredentials | null {
   if (!account) return null
 
   let reloaded: ClaudeCredentials | null
