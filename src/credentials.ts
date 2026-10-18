@@ -1142,7 +1142,10 @@ const REFRESH_WAIT_MS = (() => {
 
 const REFRESH_POLL_MS = 2_500
 
-export function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+export function sleepAbortable(
+  ms: number,
+  signal?: AbortSignal,
+): Promise<void> {
   return new Promise((resolve) => {
     if (signal?.aborted) {
       resolve()
@@ -1390,6 +1393,11 @@ export async function retryAfterCooldownWait(options: {
   if (!config.enabled) return null
 
   const now = options.now ?? Date.now()
+  // A completed bench makes a previously tried source eligible again. A
+  // permanent exclusion here strands a one-account pool after its first 429.
+  for (const source of options.triedSources)
+    if (!isRotationCooldownActive(source, now))
+      options.triedSources.delete(source)
   const roster = refreshAccountsList()
   const invalid = options.invalidSources ?? new Set<string>()
   const excluded = new Set([...options.triedSources, ...invalid])

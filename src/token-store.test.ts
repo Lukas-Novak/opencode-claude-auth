@@ -1,10 +1,19 @@
 import { describe, it, beforeEach } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, statSync, writeFileSync } from "node:fs"
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   addTokens,
+  clearSessionTokens,
+  writeTokenStore,
   isTokenSource,
   listTokenEntries,
   parsePastedTokens,
@@ -29,6 +38,7 @@ const TOKEN_C = "sk-ant-oat02-CCCCCCCCCCCCCCCCCCCCCC"
  * test observes another's tokens or the developer's real ones.
  */
 function isolateStore(): string {
+  clearSessionTokens()
   const dir = mkdtempSync(join(tmpdir(), "claude-auth-tokenstore-"))
   const path = join(dir, "tokens.json")
   process.env.OPENCODE_CLAUDE_AUTH_TOKENS_FILE = path
@@ -333,5 +343,60 @@ describe("store resilience", () => {
     delete process.env.OPENCODE_CLAUDE_AUTH_TOKENS
     delete process.env.CLAUDE_CODE_OAUTH_TOKEN
     assert.deepEqual(readTokenStore().accounts, [])
+  })
+})
+
+describe("token store hardening parity with ou4", () => {
+  beforeEach(isolateStore)
+
+  function unwritableStore() {
+    const dir = mkdtempSync(join(tmpdir(), "claude-auth-unwritable-"))
+    process.env.OPENCODE_CLAUDE_AUTH_TOKENS_FILE = join(dir, "sub")
+    mkdirSync(join(dir, "sub"))
+  }
+
+  it("keeps tokens usable for this session when persistence fails", () => {
+    unwritableStore()
+    const result = addTokens([TOKEN_A], "fallback")
+    assert.equal(result.persisted, false)
+    assert.equal(result.added.length, 1)
+    assert.equal(listTokenEntries()[0]?.token, TOKEN_A)
+    assert.equal(
+      readStaticCredentials(`token:${tokenIdFor(TOKEN_A)}`)?.accessToken,
+      TOKEN_A,
+    )
+    assert.equal(readTokenAccounts()[0]?.source, `token:${tokenIdFor(TOKEN_A)}`)
+  })
+
+  it("deduplicates session-only tokens", () => {
+    unwritableStore()
+    addTokens([TOKEN_A])
+    addTokens([TOKEN_A])
+    assert.equal(listTokenEntries().length, 1)
+  })
+
+  it("drops ephemeral tokens when the session is cleared", () => {
+    unwritableStore()
+    addTokens([TOKEN_A])
+    clearSessionTokens()
+    assert.equal(listTokenEntries().length, 0)
+  })
+
+  it("never writes a bearer token through a pre-created temporary-file symlink", () => {
+    const dir = mkdtempSync(join(tmpdir(), "claude-auth-symlink-"))
+    const store = join(dir, "tokens.json")
+    process.env.OPENCODE_CLAUDE_AUTH_TOKENS_FILE = store
+    const victim = join(dir, "victim.txt")
+    writeFileSync(victim, "original\n")
+    symlinkSync(victim, `${store}.tmp`)
+    symlinkSync(victim, `${store}.${process.pid}.tmp`)
+    assert.equal(
+      writeTokenStore({
+        version: 1,
+        accounts: [{ id: "a", token: TOKEN_A, addedAt: 1 }],
+      }),
+      false,
+    )
+    assert.equal(readFileSync(victim, "utf8"), "original\n")
   })
 })

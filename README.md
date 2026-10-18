@@ -156,15 +156,13 @@ claude setup-token
 
 That prints a long-lived (1-year), inference-only token starting with `sk-ant-oat01-`. Then in OpenCode:
 
-```bash
-opencode auth login
-```
+Open `/connect` and choose **Anthropic**.
 
 Pick **"Add Claude token (paste from `claude setup-token`)"** and paste. You can paste several at once, separated by spaces or commas — no need to repeat the flow per token. The optional label is what you'll see in the account picker (`work` becomes `work 1`, `work 2`, … for a multi-token paste).
 
 Pasting a token switches to it immediately. Re-pasting a token you already have is a no-op, not a duplicate account.
 
-To remove one, run `opencode auth login` and pick **"Remove a stored Claude token"**.
+To remove one, open `/connect`, choose **Anthropic**, and pick **"Remove a stored Claude token"**.
 
 Tokens are stored in `~/.local/share/opencode/claude-auth-tokens.json` with `0600` permissions. They are secrets — treat that file like an SSH key.
 
@@ -187,7 +185,7 @@ Environment tokens take priority over stored ones and are never written to disk,
 
 ## Automatic rotation on rate limits
 
-When a request comes back rate-limited, the plugin benches that account and retries on the next healthy one — within the same request, so you usually just see a toast rather than an error.
+When a request comes back rate-limited, the plugin benches that account and retries on the next healthy one within the same request. Recovery is recorded in the debug log and quota-watch countdown.
 
 - **Selection is sticky**, not round-robin: a healthy active account stays selected. Failover uses priority order among eligible accounts. Override that order with `OPENCODE_CLAUDE_AUTH_ACCOUNT_ORDER`.
 - **Benches are remembered across restarts** (`~/.local/share/opencode/claude-auth-rotation.json`), so restarting OpenCode during a usage limit doesn't put you back on the exhausted account.
@@ -195,26 +193,25 @@ When a request comes back rate-limited, the plugin benches that account and retr
 - **A bench clears as soon as the account works again**, so an early reset doesn't leave it sitting out.
 - **Long-context 429s don't rotate.** That error is about request headers, not your allowance, and every account shares it — it's handled by the existing beta-flag retry instead.
 
-The account picker in `opencode auth login` shows which accounts are benched and for how long. A request skips a benched sticky account when another account is eligible.
+Use quota-watch to see account cooldowns. A request skips a benched sticky account when another account is eligible, and waits before dispatch when the entire pool is benched.
 
 When every account is rate-limited, the plugin holds the request until the earliest recorded cooldown expires (plus a safety margin and jitter), then re-evaluates the pool and retries. Local changes to the roster or cooldowns trigger immediate re-evaluation. Progress ticks preserve the planned deadline and do not consume additional wait cycles. Concurrent processes serialize cooldown updates; each waiting request owns its own countdown file.
 
-Caller cancellation stops the wait. If OpenCode's **response-header deadline** expires during a quota wait, the plugin returns a deferred 429 with `retry-after` computed from the earliest cooldown, allowing OpenCode's retry scheduler to continue. For uninterrupted long waits, merge `"headerTimeout": false` and `"timeout": false` into `provider.anthropic.options` and restart OpenCode. Actual network attempts still have their own header deadline (`OPENCODE_CLAUDE_AUTH_NETWORK_TIMEOUT_MS`, default 120 seconds).
+Caller cancellation stops the wait. The runtime registers native Effect HTTP hooks to propagate OpenCode's execution cancellation to the underlying Promise-based transport. A synthetic **response-header deadline** during response recovery returns a deferred 429 with `retry-after` computed from the earliest cooldown; a genuine Stop remains cancellation. Physical retry fetches have their own header deadline (`OPENCODE_CLAUDE_AUTH_NETWORK_TIMEOUT_MS`, default 120 seconds), separate from quota waits.
 
 `OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_MAX_CYCLES` limits wait/replanning cycles and `OPENCODE_CLAUDE_AUTH_ROTATE_WAIT_MAX_MS` limits cumulative sleep. Both default to unlimited. `OPENCODE_CLAUDE_AUTH_ROTATE_WAIT=0` disables waiting.
 
 ### Regression and sandbox tests
 
 ```bash
-npm run test:node18
-npm run build
-node scripts/e2e-notouch.mjs --scenario concurrent
-node scripts/e2e-notouch.mjs --scenario stop
-node scripts/e2e-notouch.mjs --scenario deadline
-node scripts/e2e-notouch.mjs --scenario long
+pnpm build
+pnpm test:isolated
+python3 scripts/check-v2-runtime.py --opencode /path/to/opencode
+# Optional: also cross the 300-second boundary with a real held quota wait.
+python3 scripts/check-v2-runtime.py --opencode /path/to/opencode --long
 ```
 
-The sandbox scenarios start their own OpenCode server, use an isolated HOME/config/cache and mock tokens, and route plugin HTTP requests exclusively to a loopback stub. `long` takes roughly six minutes and asserts that automatic completion crosses the actual 300-second boundary. `deadline` shortens OpenCode's header deadline to exercise native retry. Successful runs remove their sandbox; failures print its path for inspection. Set `OPENCODE_BIN` to use a particular OpenCode binary.
+The runtime check starts its own OpenCode 2 server, uses an isolated HOME/config/cache/database and mock tokens, and routes model HTTP requests to a loopback stub. It tests package loading, `/connect` token methods, three-account rotation, cooldown recovery, quota-watch, early wake, concurrent waits, real Stop, and restart persistence. Pass `--keep` to retain fixture logs. It does not alter the user's credentials or running server. The legacy `e2e-notouch.mjs` scenarios target the V1 API and are not V2 runtime checks.
 
 ### Seeing the real next-attempt countdown
 
@@ -228,9 +225,9 @@ node scripts/quota-watch.mjs --watch \
   --time-zone Europe/Prague
 ```
 
-The display ticks locally every second and refreshes OpenCode's read-only `/session/status` endpoint every 15 seconds. It makes no Anthropic requests and never sends credentials. A missing plugin-wait file does **not** imply a stopped session: OpenCode may be waiting on its own `retry.next` deadline. Account eligibility and a scheduled retry are displayed separately.
+The display ticks locally every second and makes no Anthropic requests. Local cooldown/countdown display works with V1 and V2. The optional `--server` / `--session` status integration above uses the **V1** `/session/status` endpoint; it does not support V2's authenticated API. A missing plugin-wait file does **not** imply a stopped session.
 
-Plugin progress notifications use OpenCode's `tui.showToast`. Paseo's current OpenCode adapter does not forward those to its chat panel, and it forwards the native retry message without the `next` timestamp. Therefore the watcher provides a terminal countdown; displaying it inline in Paseo chat requires a separate adapter/UI change.
+The V2 port reports progress through debug logs and per-request countdown files, not V1 `tui.showToast` notifications. Inline Paseo chat countdowns require a separate adapter/UI change.
 
 To turn rotation off and keep manual switching only:
 
@@ -261,10 +258,10 @@ If only one account is found, the selection prompt is skipped and the plugin use
 | "Extra usage is required for long context requests"                                   | Your conversation exceeded 200k tokens. See [Long context (1M)](#long-context-1m) below                                                                                                                       |
 | Plugin not updating to latest version                                                 | Delete the cached package: `rm -rf ~/.cache/opencode/packages/opencode-claude-auth@latest/` then restart OpenCode                                                                                             |
 | `opencode auth login` prints "Only http and https links can be opened in the browser" | Harmless: importing has no browser step, but the CLI tries to open one anyway. The credential is still saved — confirm with `opencode auth list`                                                              |
-| Pasted token rejected as invalid                    | It must look like `sk-ant-oat01-…` from `claude setup-token`. An `sk-ant-api03-…` API key is a different thing and won't work here        |
-| "All Claude accounts are rate-limited"              | Every account is benched. Wait for the soonest cooldown (OpenCode retries pick back up automatically), or reconnect with a fresh account/token |
-| Rotation isn't switching accounts                   | Confirm more than one account is in the pool and that `OPENCODE_CLAUDE_AUTH_ROTATE` isn't `0`                                           |
-| Want one subscription used first                    | Set `OPENCODE_CLAUDE_AUTH_ACCOUNT_ORDER` to the account sources in your preferred order                                                   |
+| Pasted token rejected as invalid                                                      | It must look like `sk-ant-oat01-…` from `claude setup-token`. An `sk-ant-api03-…` API key is a different thing and won't work here                                                                            |
+| "All Claude accounts are rate-limited"                                                | Every account is benched. Wait for the soonest cooldown (OpenCode retries pick back up automatically), or reconnect with a fresh account/token                                                                |
+| Rotation isn't switching accounts                                                     | Confirm more than one account is in the pool and that `OPENCODE_CLAUDE_AUTH_ROTATE` isn't `0`                                                                                                                 |
+| Want one subscription used first                                                      | Set `OPENCODE_CLAUDE_AUTH_ACCOUNT_ORDER` to the account sources in your preferred order                                                                                                                       |
 
 ### Diagnostic logging
 

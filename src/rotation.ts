@@ -44,6 +44,8 @@ export interface CooldownEntry {
   reason: string
   /** When the bench was applied. */
   at: number
+  /** Consecutive limits without an authoritative reset time. */
+  unspecifiedCount?: number
 }
 
 export interface RotationStateFile {
@@ -424,6 +426,36 @@ export function cooldownFromResponse(
   return { ms: cap(config.defaultCooldownMs), reason: "unspecified-429" }
 }
 
+/** A reset explicitly stated by the provider, rather than our estimate. */
+export function isAuthoritativeCooldownReason(reason: string): boolean {
+  return (
+    reason === "retry-after" ||
+    reason === "retry-after-date" ||
+    reason.startsWith("anthropic-ratelimit-")
+  )
+}
+
+function escalatingDefaultCooldown(
+  existing: CooldownEntry | undefined,
+  baseMs: number,
+  reason: string,
+  rng: () => number,
+): { ms: number; unspecifiedCount?: number } {
+  if (reason !== "unspecified-429" && reason !== "usage-limit-body")
+    return { ms: baseMs }
+  const count = (existing?.unspecifiedCount ?? 0) + 1
+  if (count === 1) return { ms: baseMs, unspecifiedCount: count }
+  const ceiling = getRotationConfig().maxCooldownMs
+  const escalated = Math.min(ceiling, baseMs * 2 ** (count - 1))
+  return {
+    ms: Math.min(
+      ceiling,
+      Math.max(baseMs, Math.round(escalated * (0.5 + rng() * 0.5))),
+    ),
+    unspecifiedCount: count,
+  }
+}
+
 export function markRateLimited(
   source: string,
   cooldownMs: number,
@@ -444,19 +476,30 @@ function markRateLimitedLocked(
   rng: () => number,
 ): number {
   const state = readRotationState()
-  const until = now + cooldownMs
+  const existing = state.cooldowns[source]
+  const effective = escalatingDefaultCooldown(existing, cooldownMs, reason, rng)
+  const until = now + effective.ms
   // Never shorten a bench that is already longer: a 429 arriving from an
   // in-flight request started before the bench must not undo it.
-  const existing = state.cooldowns[source]
   if (existing && existing.until > until) return existing.until
 
-  state.cooldowns[source] = { until, reason, at: now }
+  state.cooldowns[source] = {
+    until,
+    reason,
+    at: now,
+    ...(effective.unspecifiedCount !== undefined
+      ? { unspecifiedCount: effective.unspecifiedCount }
+      : {}),
+  }
   writeRotationState(state)
   log("rotation_marked_limited", {
     source,
     until,
-    cooldownMs,
+    cooldownMs: effective.ms,
     reason,
+    ...(effective.unspecifiedCount !== undefined
+      ? { unspecifiedCount: effective.unspecifiedCount }
+      : {}),
   })
   return until
 }

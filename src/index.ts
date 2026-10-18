@@ -1,6 +1,13 @@
 import { Credential, Integration, Plugin, Provider } from "@opencode/plugin"
+import { Plugin as EffectPlugin } from "@opencode/plugin/effect"
+import { fromPromise } from "@opencode/plugin/promise/adapter"
 import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/promise/integration"
-import type { SessionRequest } from "@opencode/plugin/promise/session"
+import type {
+  SessionHttpRequest,
+  SessionHttpResponse,
+  SessionRequest,
+} from "@opencode/plugin/promise/session"
+import { Effect, type Scope } from "effect"
 import {
   chooseInitialAccount,
   getAccountBySource,
@@ -34,7 +41,6 @@ import {
   removeToken,
   tokenFingerprint,
   validateTokenInput,
-  getTokenStorePath,
 } from "./token-store.ts"
 
 export * from "./betas.ts"
@@ -195,9 +201,7 @@ function tokenMethod() {
 
       const roster = refreshAccountsList()
       const target = result.added[0]
-        ? roster.find(
-            (a) => a.source === `token:${result.added[0]?.id ?? ""}`,
-          )
+        ? roster.find((a) => a.source === `token:${result.added[0]?.id ?? ""}`)
         : undefined
 
       if (target) {
@@ -252,9 +256,7 @@ function tokenMethod() {
  * Registered only when there is something to remove — the form's option list
  * is built once at startup, so a token added later appears after a restart.
  */
-function removeTokenMethod(
-  entries: ReturnType<typeof listTokenEntries>,
-) {
+function removeTokenMethod(entries: ReturnType<typeof listTokenEntries>) {
   return {
     integrationID: INTEGRATION_ID,
     method: {
@@ -316,150 +318,204 @@ function removeTokenMethod(
   } satisfies IntegrationOAuthMethodRegistration
 }
 
-export const ClaudeAuthPlugin = Plugin.define({
-  id: "griffinmartin.claude-auth",
-  setup: async (ctx) => {
-    initLogger()
-    let accounts: ReturnType<typeof readAllClaudeAccounts> = []
-    try {
-      accounts = readAllClaudeAccounts()
-    } catch (cause) {
-      log("plugin_init_error", { cause: String(cause) })
-    }
-    initAccounts(accounts)
+type RegisterHttpHooks = (
+  ctx: Plugin.Context,
+  request: (event: SessionHttpRequest, signal?: AbortSignal) => Promise<void>,
+  response: (event: SessionHttpResponse, signal?: AbortSignal) => Promise<void>,
+) => Promise<void>
 
-    // Step over an account that is still benched from a rate limit hit in an
-    // earlier session, so restarting OpenCode during a usage limit lands on a
-    // working account instead of replaying the limit on the first prompt.
-    const persisted = loadPersistedAccountSource()
-    const initial =
-      accounts.length > 0
-        ? (chooseInitialAccount(accounts, persisted) ?? accounts[0])
-        : undefined
-    if (initial) setActiveAccountSource(initial.source)
-
-    await ctx.integration.transform((draft) => {
-      draft.update(INTEGRATION_ID, (integration) => {
-        integration.name = "Anthropic"
-      })
-      draft.method.update(oauth(accounts))
-      draft.method.update(tokenMethod())
-      const stored = listTokenEntries().filter((entry) => entry.addedAt !== 0)
-      if (stored.length > 0) draft.method.update(removeTokenMethod(stored))
-    })
-
-    // The Anthropic integration keeps its built-in API-key method alongside
-    // the subscription methods registered above, so only OAuth usage is free.
-    const hasSubscriptionConnection = async (): Promise<boolean> => {
-      const connection = await ctx.integration.connection.active(INTEGRATION_ID)
-      if (!connection) return false
-      const credential = await ctx.integration.connection.resolve(connection)
-      return !!credential && isPluginCredential(credential)
-    }
-
-    let subscription: boolean = false
-    const loadConnection = async () => {
+function createClaudeAuthPlugin(
+  registerHttpHooks: RegisterHttpHooks = async (ctx, request, response) => {
+    await ctx.session.hook("http.request", (event) => request(event))
+    await ctx.session.hook("http.response", (event) => response(event))
+  },
+): Plugin.Plugin {
+  return Plugin.define({
+    id: "griffinmartin.claude-auth",
+    setup: async (ctx) => {
+      initLogger()
+      let accounts: ReturnType<typeof readAllClaudeAccounts> = []
       try {
-        subscription = await hasSubscriptionConnection()
+        accounts = readAllClaudeAccounts()
       } catch (cause) {
-        subscription = false
-        log("connection_lookup_failed", { cause: String(cause) })
+        log("plugin_init_error", { cause: String(cause) })
       }
-    }
-    await loadConnection()
+      initAccounts(accounts)
 
-    await ctx.provider.transform((provider) => {
-      const anthropic = provider.get(PROVIDER_ID)
-      if (!anthropic) return
-      provider.update(PROVIDER_ID, (info) => {
-        info.name = "Anthropic"
-        info.integrationID = INTEGRATION_ID
-      })
-      for (const [modelID] of anthropic.models) {
-        provider.models.update(PROVIDER_ID, modelID, (model) => {
-          if (subscription) model.cost = []
+      // Step over an account that is still benched from a rate limit hit in an
+      // earlier session, so restarting OpenCode during a usage limit lands on a
+      // working account instead of replaying the limit on the first prompt.
+      const persisted = loadPersistedAccountSource()
+      const initial =
+        accounts.length > 0
+          ? (chooseInitialAccount(accounts, persisted) ?? accounts[0])
+          : undefined
+      if (initial) setActiveAccountSource(initial.source)
+
+      await ctx.integration.transform((draft) => {
+        draft.update(INTEGRATION_ID, (integration) => {
+          integration.name = "Anthropic"
         })
-      }
-    })
+        draft.method.update(oauth(accounts))
+        draft.method.update(tokenMethod())
+        const stored = listTokenEntries().filter((entry) => entry.addedAt !== 0)
+        if (stored.length > 0) draft.method.update(removeTokenMethod(stored))
+      })
 
-    // Re-evaluate when the user switches credentials so the provider follows
-    // the active connection instead of whatever was selected at startup.
-    const watcher = new AbortController()
-    void (async () => {
-      for await (const event of ctx.event.subscribe({
-        signal: watcher.signal,
-      })) {
-        if (
-          event.type === "credential.updated" ||
-          (event.type === "credential.switched" &&
-            event.data.integrationID === INTEGRATION_ID)
-        ) {
-          const before: boolean = subscription
-          await loadConnection()
-          if (subscription !== before) await ctx.provider.reload()
+      // The Anthropic integration keeps its built-in API-key method alongside
+      // the subscription methods registered above, so only OAuth usage is free.
+      const hasSubscriptionConnection = async (): Promise<boolean> => {
+        const connection =
+          await ctx.integration.connection.active(INTEGRATION_ID)
+        if (!connection) return false
+        const credential = await ctx.integration.connection.resolve(connection)
+        return !!credential && isPluginCredential(credential)
+      }
+
+      let subscription: boolean = false
+      const loadConnection = async () => {
+        try {
+          subscription = await hasSubscriptionConnection()
+        } catch (cause) {
+          subscription = false
+          log("connection_lookup_failed", { cause: String(cause) })
         }
       }
-    })().catch((cause) => {
-      if (!watcher.signal.aborted)
-        log("connection_watch_failed", { cause: String(cause) })
-    })
+      await loadConnection()
 
-    for (const kind of IDENTITY_REQUEST_HOOKS)
-      await ctx.session.hook(kind, (event) => {
-        if (subscription) injectClaudeIdentity(event)
+      await ctx.provider.transform((provider) => {
+        const anthropic = provider.get(PROVIDER_ID)
+        if (!anthropic) return
+        provider.update(PROVIDER_ID, (info) => {
+          info.name = "Anthropic"
+          info.integrationID = INTEGRATION_ID
+        })
+        for (const [modelID] of anthropic.models) {
+          provider.models.update(PROVIDER_ID, modelID, (model) => {
+            if (subscription) model.cost = []
+          })
+        }
       })
 
-    // OpenCode's native Anthropic provider owns prompt conversion and streaming.
-    // These HTTP hooks apply only the Claude Code subscription wire contract.
-    // Cross-account rotation on rate limits lives in finishClaudeResponse.
-    const requests = new WeakMap<Request, { source?: string }>()
-    await ctx.session.hook("http.request", async (event) => {
-      if (event.model.providerID !== PROVIDER_ID) return
-      const connection = await ctx.integration.connection.active(INTEGRATION_ID)
-      if (!connection) return
-      const credential = await ctx.integration.connection.resolve(connection)
-      if (!credential || credential.type !== "oauth") return
-      if (!isPluginCredential(credential)) return
-      const source =
-        typeof credential.metadata?.source === "string"
-          ? credential.metadata.source
-          : undefined
-      event.request = await prepareClaudeRequest(
-        event.request,
-        credential.access,
-        source,
-      )
-      requests.set(event.request, { source })
-    })
-    await ctx.session.hook("http.response", async (event) => {
-      const context = requests.get(event.request)
-      if (!context) return
-      requests.delete(event.request)
-      event.response = await finishClaudeResponse(
-        event.request,
-        event.response,
-        context.source,
-      )
-    })
-
-    if (accounts.length === 0) {
-      log("plugin_init_no_accounts", { reason: "no credentials found" })
-    } else {
-      log("plugin_init", {
-        accountCount: accounts.length,
-        sources: accounts.map((account) => account.source),
-        activeSource: initial?.source ?? null,
-        pastedTokens: accounts.filter((account) =>
-          isTokenSource(account.source),
-        ).length,
-        cooldowns: activeCooldowns().length,
+      // Re-evaluate when the user switches credentials so the provider follows
+      // the active connection instead of whatever was selected at startup.
+      const watcher = new AbortController()
+      void (async () => {
+        for await (const event of ctx.event.subscribe({
+          signal: watcher.signal,
+        })) {
+          if (
+            event.type === "credential.updated" ||
+            (event.type === "credential.switched" &&
+              event.data.integrationID === INTEGRATION_ID)
+          ) {
+            const before: boolean = subscription
+            await loadConnection()
+            if (subscription !== before) await ctx.provider.reload()
+          }
+        }
+      })().catch((cause) => {
+        if (!watcher.signal.aborted)
+          log("connection_watch_failed", { cause: String(cause) })
       })
-    }
 
-    return () => {
-      watcher.abort()
-    }
-  },
+      for (const kind of IDENTITY_REQUEST_HOOKS)
+        await ctx.session.hook(kind, (event) => {
+          if (subscription) injectClaudeIdentity(event)
+        })
+
+      // OpenCode's native Anthropic provider owns prompt conversion and streaming.
+      // These HTTP hooks apply only the Claude Code subscription wire contract.
+      // Cross-account rotation on rate limits lives in finishClaudeResponse.
+      const requests = new WeakMap<Request, { source?: string }>()
+      const onRequest = async (
+        event: SessionHttpRequest,
+        signal?: AbortSignal,
+      ) => {
+        if (event.model.providerID !== PROVIDER_ID) return
+        const connection =
+          await ctx.integration.connection.active(INTEGRATION_ID)
+        if (!connection) return
+        const credential = await ctx.integration.connection.resolve(connection)
+        if (!credential || credential.type !== "oauth") return
+        if (!isPluginCredential(credential)) return
+        const source =
+          typeof credential.metadata?.source === "string"
+            ? credential.metadata.source
+            : undefined
+        event.request = await prepareClaudeRequest(
+          event.request,
+          credential.access,
+          source,
+          signal,
+        )
+        requests.set(event.request, { source })
+      }
+      const onResponse = async (
+        event: SessionHttpResponse,
+        signal?: AbortSignal,
+      ) => {
+        const context = requests.get(event.request)
+        if (!context) return
+        requests.delete(event.request)
+        event.response = await finishClaudeResponse(
+          event.request,
+          event.response,
+          context.source,
+          undefined,
+          signal,
+        )
+      }
+      await registerHttpHooks(ctx, onRequest, onResponse)
+
+      if (accounts.length === 0) {
+        log("plugin_init_no_accounts", { reason: "no credentials found" })
+      } else {
+        log("plugin_init", {
+          accountCount: accounts.length,
+          sources: accounts.map((account) => account.source),
+          activeSource: initial?.source ?? null,
+          pastedTokens: accounts.filter((account) =>
+            isTokenSource(account.source),
+          ).length,
+          cooldowns: activeCooldowns().length,
+        })
+      }
+
+      return () => {
+        watcher.abort()
+      }
+    },
+  })
+}
+
+/** Promise entrypoint retained for direct transport/unit harnesses. */
+export const ClaudeAuthPlugin = createClaudeAuthPlugin()
+
+/** Promise hooks expose no execution signal in OpenCode 2.0.32. Register the
+ * long-lived HTTP work natively so Effect interruption (Stop, remove, unload)
+ * aborts filesystem waits and resends instead of leaving a detached Promise. */
+const runtimePlugin: EffectPlugin.Plugin = EffectPlugin.define({
+  id: ClaudeAuthPlugin.id,
+  effect: (ctx) =>
+    Effect.gen(function* () {
+      const run = Effect.runPromiseWith(yield* Effect.context<Scope.Scope>())
+      const promise = createClaudeAuthPlugin(
+        async (_ctx, request, response) => {
+          await run(
+            ctx.session.hook("http.request", (event) =>
+              Effect.promise((signal) => request(event, signal)),
+            ),
+          )
+          await run(
+            ctx.session.hook("http.response", (event) =>
+              Effect.promise((signal) => response(event, signal)),
+            ),
+          )
+        },
+      )
+      yield* fromPromise(promise).effect(ctx)
+    }),
 })
 
-export default ClaudeAuthPlugin
+export default runtimePlugin

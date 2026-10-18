@@ -17,7 +17,8 @@ process.env.OPENCODE_CLAUDE_AUTH_ROTATION_FILE = join(
 )
 process.env.OPENCODE_CLAUDE_AUTH_TOKENS_FILE = join(stateTestDir, "tokens.json")
 process.env.CLAUDE_CONFIG_DIR = join(stateTestDir, "claude-config")
-import plugin, {
+import runtimePlugin, {
+  ClaudeAuthPlugin as plugin,
   IDENTITY_REQUEST_HOOKS,
   injectClaudeIdentity,
 } from "./index.ts"
@@ -50,6 +51,8 @@ describe("OpenCode 2 plugin", () => {
   it("exports the V2 plugin module shape", () => {
     assert.equal(plugin.id, "griffinmartin.claude-auth")
     assert.equal(typeof plugin.setup, "function")
+    assert.equal(runtimePlugin.id, plugin.id)
+    assert.equal(typeof runtimePlugin.effect, "function")
   })
 })
 

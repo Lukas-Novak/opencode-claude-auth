@@ -52,7 +52,7 @@
   },
   "scripts": {
     "build": "rm -rf dist && tsc && cp src/anthropic-prompt.txt dist/",
-    "test": "node --test --experimental-strip-types src/**/*.test.ts scripts/**/*.test.ts",
+    "test": "sh scripts/test-isolated.sh",
     "test:isolated": "sh scripts/test-isolated.sh",
     "test:models": "pnpm run build && node scripts/test-models.ts",
     "test:headless": "pnpm run build && node --experimental-strip-types scripts/test-headless.ts",
@@ -71,10 +71,14 @@
   "devDependencies": {
     "@opencode/client": "2.0.31",
     "@types/node": "^25.5.0",
+    "effect": "4.0.1",
     "oxfmt": "0.41.0",
     "oxlint": "1.56.0",
     "tsx": "^4.23.15",
     "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "effect": "^4.0.1"
   },
   "packageManager": "pnpm@10.32.1"
 }

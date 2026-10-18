@@ -22,14 +22,20 @@ wrapper into OpenCode 2's `http.request` / `http.response` hooks.
 
 ### Bug Fixes
 
+* restore the quota-continuation semantics verified against the ou4 fork: a single availability loop owns preflight and 429 waits, expired benches are reconsidered without re-benching stale responses, and filesystem changes trigger immediate re-planning.
+* attribute preempted requests to the account actually sent, so another account's success/401/429 cannot clear, refresh, or bench the sticky credential's account.
+* send message-endpoint 429s directly to account rotation instead of retrying the same account first; keep network header deadlines confined to physical fetches.
+* register HTTP hooks through the Effect API so a real OpenCode Stop interrupts the wait promptly. The Promise hook adapter in 2.0.32 does not expose its execution signal.
+* restore escalating cooldowns for repeated unexplained limits, exclusive token-store writes, and session-only fallback when token persistence fails.
+* add transport/policy regressions and `scripts/check-v2-runtime.py`, which tests the built package through a private OpenCode 2 server against a loopback Anthropic fixture, with isolated credentials and database.
 * redact `sk-ant-*` values in the debug log. Only JWT-shaped values and three specific keys were redacted before, so a `sk-ant-oat…` or `sk-ant-api…` value logged under another key could reach a file the README describes as safe to attach to an issue.
 
 ### Port simplifications vs the v1 fork
 
-* rate-limit recovery rides OpenCode 2's native request hooks: rotation and quota waits happen inside the `http.response` hook instead of a replaced `fetch`. OpenCode enforces a per-attempt request timeout that will abort a long wait mid-sleep; the abort surfaces the 429, OpenCode retries on its own backoff, and the hook re-enters and keeps waiting, so long quota windows still resolve — just across several attempts instead of one unbroken sleep.
+* rate-limit recovery rides OpenCode 2's native request hooks instead of a replaced provider `fetch`. A synthetic header deadline during response recovery returns a deferred 429 with a cooldown-derived `retry-after`; a genuine Stop remains cancellation.
 * account-switch and quota progress go to the debug log and the quota-watch publication only; TUI toast notifications from the v1 fork are not ported (the hook has no TUI client).
 * the remove-token method's option list is built at startup; tokens added in the same session appear after a restart.
-* `src/index-quota-wait.test.ts` and `src/rotation-stress.test.ts` drove the v1 wrapper end-to-end and are parked as `*.legacy-test.ts` (out of the test glob) until they are re-expressed against the `http.response` hook. Engine suites (`rotation`, `rotation-process`, `http-lifecycle`, `credentials`, `provider`, `token-store`, `quota-watch`) run green.
+* the old v1-wrapper suites remain parked as `*.legacy-test.ts`. Their v2 replacements are `provider-rotation.test.ts`, `rotation-parity.test.ts`, the token-store hardening tests, and `scripts/check-v2-runtime.py`; they run alongside the engine suites.
 
 ## [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/compare/v2.2.1...v3.0.0) (2026-10-16)
 
@@ -50,7 +56,6 @@ wrapper into OpenCode 2's `http.request` / `http.response` hooks.
 * update Claude Code version to 2.1.280 for Opus 5.5 ([#285](https://github.com/griffinmartin/opencode-claude-auth/issues/285)) ([662ee99](https://github.com/griffinmartin/opencode-claude-auth/commit/662ee99d3ace0aa7123e8ca6b4fc0e1ff4fd48e8))
 
 
->>>>>>> 9af1182 (feat: harden automatic Claude quota continuation)
 ## [2.2.0](https://github.com/griffinmartin/opencode-claude-auth/compare/v2.1.6...v2.2.0) (2026-09-01)
 
 

@@ -16,8 +16,10 @@
  */
 import {
   chmodSync,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   writeFileSync,
@@ -65,6 +67,9 @@ export interface TokenStoreFile {
   version: 1
   accounts: StoredToken[]
 }
+
+/** A paste accepted when persistence failed must remain usable this session. */
+const sessionTokens: StoredToken[] = []
 
 export function getTokenStorePath(): string {
   return (
@@ -157,12 +162,15 @@ export function writeTokenStore(file: TokenStoreFile): boolean {
     // Write-then-rename so an interrupted write cannot leave a truncated file
     // where the only copy of a pasted token used to be. `setup-token` values
     // are not recoverable from anywhere else on the machine.
-    const tmp = `${path}.tmp`
-    writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, {
-      encoding: "utf-8",
-      mode: 0o600,
-    })
-    if (process.platform !== "win32") chmodSync(tmp, 0o600)
+    // Refuse hostile pre-created symlinks rather than writing a bearer token
+    // through a predictable temporary filename.
+    const tmp = `${path}.${process.pid}.tmp`
+    const fd = openSync(tmp, "wx", 0o600)
+    try {
+      writeFileSync(fd, `${JSON.stringify(file, null, 2)}\n`, "utf-8")
+    } finally {
+      closeSync(fd)
+    }
     renameSync(tmp, path)
     if (process.platform !== "win32") chmodSync(path, 0o600)
     log("token_store_written", { count: file.accounts.length })
@@ -263,6 +271,12 @@ export function addTokens(tokens: string[], label?: string): AddTokensResult {
   })
 
   const persisted = added.length > 0 ? writeTokenStore(store) : true
+  if (!persisted) {
+    for (const entry of added)
+      if (!sessionTokens.some((token) => token.id === entry.id))
+        sessionTokens.push(entry)
+    log("token_store_session_fallback", { count: added.length })
+  }
   log("token_store_add", {
     added: added.length,
     duplicates: duplicates.length,
@@ -332,20 +346,27 @@ export function staticCredentialsFor(entry: StoredToken): ClaudeCredentials {
 }
 
 /**
- * Every pasted token, environment first, then the stored file, with
+ * Every pasted token, environment first, then session fallbacks and the stored file, with
  * explicitly-prioritised entries ahead of unprioritised ones.
  */
 export function listTokenEntries(): StoredToken[] {
   const env = readEnvTokens()
   const seen = new Set(env.map((e) => e.id))
+  const session = sessionTokens.filter((token) => !seen.has(token.id))
+  for (const token of session) seen.add(token.id)
   const stored = readTokenStore().accounts.filter(
     (a) => !a.disabled && !seen.has(a.id),
   )
-  return [...env, ...stored].sort(
+  return [...env, ...session, ...stored].sort(
     (a, b) =>
       (a.priority ?? Number.MAX_SAFE_INTEGER) -
       (b.priority ?? Number.MAX_SAFE_INTEGER),
   )
+}
+
+/** Drop the ephemeral fallback, primarily for isolated tests. */
+export function clearSessionTokens(): void {
+  sessionTokens.length = 0
 }
 
 /** Pasted tokens as accounts, ready to append to the discovered pool. */

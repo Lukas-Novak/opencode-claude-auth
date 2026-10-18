@@ -162,7 +162,16 @@ describe("quota-watch", () => {
     }
     const result = execFileSync(process.execPath, [script], {
       encoding: "utf8",
-      env: { ...process.env, XDG_DATA_HOME: join(root, "data") },
+      env: {
+        ...process.env,
+        XDG_DATA_HOME: join(root, "data"),
+        OPENCODE_CLAUDE_AUTH_TOKENS_FILE: join(data, "claude-auth-tokens.json"),
+        OPENCODE_CLAUDE_AUTH_ROTATION_FILE: join(
+          data,
+          "claude-auth-rotation.json",
+        ),
+        OPENCODE_CLAUDE_AUTH_WAIT_DIR: waits,
+      },
     })
     assert.match(result, /2 in-flight quota waits/)
     assert.match(result, /STALE/)
