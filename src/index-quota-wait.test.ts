@@ -14,7 +14,7 @@
  */
 
 import assert from "node:assert/strict"
-import { mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -26,7 +26,10 @@ import {
   createWaitAttemptId,
   earliestCooldown,
   getRotationWaitConfig,
+  isHardAuthCooldownReason,
   markRateLimited,
+  ORG_OAUTH_NOT_ALLOWED_REASON,
+  pruneCooldown,
   publishWaitAttempt,
   readRotationState,
   readWaitAttempts,
@@ -1336,5 +1339,298 @@ describe("quota wait — integration", () => {
     } finally {
       h.cleanup()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Org-block 403 ("OAuth authentication is currently not allowed for this
+// organization."): benched like a rate limit and rotated around, but never
+// the target of a quota wait — the org admin or a re-auth has to change it.
+// ---------------------------------------------------------------------------
+
+function orgBlocked(): Response {
+  return new Response(
+    '{"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."}}',
+    { status: 403 },
+  )
+}
+
+describe("org-block 403 — integration", () => {
+  it("benches the org-blocked sticky account and switches to the healthy one", async () => {
+    const h = await setupHarness({ accounts: [accountA, accountB] })
+    try {
+      h.setRespond((_i, auth) =>
+        auth === "Bearer token-a" ? orgBlocked() : okResponse(),
+      )
+
+      const response = await h.callFetch()
+
+      assert.equal(response.status, 200)
+      assert.equal(h.calls.length, 2)
+      assert.equal(h.calls[0]?.auth, "Bearer token-a")
+      assert.equal(h.calls[1]?.auth, "Bearer token-b")
+      // One logical request: identical body, no sleeping.
+      assert.equal(h.calls[0]?.body, h.calls[1]?.body)
+      assert.equal(h.clock.sleeps.length, 0)
+      const state = readRotationState()
+      assert.equal(
+        state.cooldowns["acct-a"]?.reason,
+        ORG_OAUTH_NOT_ALLOWED_REASON,
+      )
+      assert.ok(state.cooldowns["acct-a"]!.until > h.clock.nowMs)
+      assert.equal(state.cooldowns["acct-b"], undefined)
+      assert.equal(h.persistedSource(), "acct-b")
+      assert.equal(h.authJsonAccess(), "token-b")
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it("waits for the rate-limited account's reset when the other is org-blocked, then succeeds", async () => {
+    const h = await setupHarness({ accounts: [accountA, accountB] })
+    try {
+      h.setRespond((_i, auth) => {
+        if (auth === "Bearer token-a") return orgBlocked()
+        if (auth === "Bearer token-b" && h.clock.sleeps.length === 0) {
+          return rateLimited(45)
+        }
+        return okResponse()
+      })
+
+      const response = await h.callFetch()
+
+      assert.equal(response.status, 200)
+      assert.equal(h.calls.length, 3)
+      assert.equal(h.calls[0]?.auth, "Bearer token-a")
+      assert.equal(h.calls[1]?.auth, "Bearer token-b")
+      assert.equal(h.calls[2]?.auth, "Bearer token-b")
+      // A's bench cannot be waited toward (nothing resets), so the wait
+      // targets B's 45s retry-after plus the safety margin — one chunk.
+      assert.deepEqual(h.clock.sleeps, [46_000])
+      const state = readRotationState()
+      assert.equal(
+        state.cooldowns["acct-a"]?.reason,
+        ORG_OAUTH_NOT_ALLOWED_REASON,
+      )
+      // B served the final request, so its bench was retired on success.
+      assert.equal(state.cooldowns["acct-b"], undefined)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it("returns the org 403 immediately when no account can ever serve", async () => {
+    const h = await setupHarness({ accounts: [accountA] })
+    try {
+      h.setRespond(() => orgBlocked())
+
+      const response = await h.callFetch()
+
+      assert.equal(response.status, 403)
+      const body = await response.text()
+      assert.match(body, /currently not allowed/)
+      assert.equal(h.calls.length, 1, "no rotation possible")
+      assert.equal(
+        h.clock.sleeps.length,
+        0,
+        "must not park the request on an unrecoverable bench",
+      )
+      assert.equal(
+        readRotationState().cooldowns["acct-a"]?.reason,
+        ORG_OAUTH_NOT_ALLOWED_REASON,
+      )
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it("fails instead of waiting when every benched account is org-blocked", async () => {
+    const h = await setupHarness({ accounts: [accountA, accountB] })
+    try {
+      h.setRespond(() => orgBlocked())
+
+      const response = await h.callFetch()
+
+      assert.equal(response.status, 403)
+      assert.equal(h.calls.length, 2, "both accounts tried, then no wait")
+      assert.equal(h.clock.sleeps.length, 0)
+      const state = readRotationState()
+      assert.equal(
+        state.cooldowns["acct-a"]?.reason,
+        ORG_OAUTH_NOT_ALLOWED_REASON,
+      )
+      assert.equal(
+        state.cooldowns["acct-b"]?.reason,
+        ORG_OAUTH_NOT_ALLOWED_REASON,
+      )
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it("leaves other 403s alone — no bench, no rotation", async () => {
+    const h = await setupHarness({ accounts: [accountA, accountB] })
+    try {
+      h.setRespond(
+        () =>
+          new Response(
+            '{"type":"error","error":{"type":"invalid_request_error","message":"Request disallowed by policy"}}',
+            { status: 403 },
+          ),
+      )
+
+      const response = await h.callFetch()
+
+      assert.equal(response.status, 403)
+      assert.equal(h.calls.length, 1, "no rotation for unrelated 403s")
+      assert.deepEqual(readRotationState().cooldowns, {})
+      assert.equal(h.clock.sleeps.length, 0)
+    } finally {
+      h.cleanup()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Removing a stored token is a full logout: token entry, bench state, and any
+// active-source pin all leave with the account.
+// ---------------------------------------------------------------------------
+
+describe("removing a stored token", () => {
+  function seedTokenStore(now: number): void {
+    writeFileSync(
+      process.env.OPENCODE_CLAUDE_AUTH_TOKENS_FILE!,
+      JSON.stringify({
+        version: 1,
+        accounts: [
+          { id: "tokid1", token: "tok-one", addedAt: now, label: "One" },
+          { id: "tokid2", token: "tok-two", addedAt: now + 1, label: "Two" },
+        ],
+      }),
+      "utf-8",
+    )
+  }
+
+  function readTokenIds(): string[] {
+    const raw = JSON.parse(
+      readFileSync(process.env.OPENCODE_CLAUDE_AUTH_TOKENS_FILE!, "utf-8"),
+    ) as { accounts: { id: string }[] }
+    return raw.accounts.map((a) => a.id)
+  }
+
+  async function loadRemoveMethod(h: Harness) {
+    const plugin = (await h.helpersModule.default({} as never)) as {
+      auth?: {
+        methods?: {
+          label?: string
+          authorize?: (inputs: { id?: string }) => Promise<unknown>
+        }[]
+      }
+    }
+    const method = plugin.auth?.methods?.find(
+      (m) => m.label === "Remove a stored Claude token",
+    )
+    assert.ok(method?.authorize, "remove flow must exist")
+    return method.authorize!
+  }
+
+  it("prunes the removed account's bench from the rotation state", async () => {
+    const h = await setupHarness({ accounts: [accountA] })
+    try {
+      seedTokenStore(NOW)
+      const authorize = await loadRemoveMethod(h)
+      markRateLimited("token:tokid1", 120_000, "retry-after", NOW)
+
+      await authorize({ id: "tokid1" })
+
+      assert.deepEqual(readTokenIds(), ["tokid2"])
+      assert.equal(
+        readRotationState().cooldowns["token:tokid1"],
+        undefined,
+        "removal must not leave a bench for a deleted account",
+      )
+      // The surviving account's state (none here) is untouched.
+      assert.deepEqual(readRotationState().cooldowns, {})
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it("re-points the active source when the removed account was active", async () => {
+    const h = await setupHarness({ accounts: [accountA] })
+    try {
+      seedTokenStore(NOW)
+      // Pin the session to the account that is about to be removed.
+      const sourceDir = join(
+        h.homeDir,
+        ".local",
+        "share",
+        "opencode",
+      )
+      mkdirSync(sourceDir, { recursive: true })
+      writeFileSync(
+        join(sourceDir, "claude-account-source.txt"),
+        "token:tokid1",
+        "utf-8",
+      )
+      const authorize = await loadRemoveMethod(h)
+
+      await authorize({ id: "tokid1" })
+
+      assert.deepEqual(readTokenIds(), ["tokid2"])
+      assert.equal(
+        h.persistedSource(),
+        "acct-a",
+        "active source must move to the first remaining account",
+      )
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it("is a no-op for unknown ids", async () => {
+    const h = await setupHarness({ accounts: [accountA] })
+    try {
+      seedTokenStore(NOW)
+      const authorize = await loadRemoveMethod(h)
+      markRateLimited("token:tokid1", 120_000, "retry-after", NOW)
+
+      await authorize({ id: "does-not-exist" })
+
+      assert.deepEqual(readTokenIds(), ["tokid1", "tokid2"])
+      assert.ok(readRotationState().cooldowns["token:tokid1"])
+    } finally {
+      h.cleanup()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Unit: hard-auth bench helpers + prune
+// ---------------------------------------------------------------------------
+
+describe("hard-auth bench helpers — unit", () => {
+  it("classifies only the org-block reason as hard auth", () => {
+    assert.equal(isHardAuthCooldownReason(ORG_OAUTH_NOT_ALLOWED_REASON), true)
+    assert.equal(isHardAuthCooldownReason("retry-after"), false)
+    assert.equal(isHardAuthCooldownReason("unspecified-429"), false)
+    assert.equal(
+      isHardAuthCooldownReason("anthropic-ratelimit-unified-reset"),
+      false,
+    )
+    assert.equal(
+      isHardAuthCooldownReason("usage-limit-body"),
+      false,
+    )
+  })
+
+  it("pruneCooldown drops only the named bench", () => {
+    isolateRotationFile()
+    markRateLimited("acct-a", 60_000, "retry-after", NOW)
+    markRateLimited("acct-b", 120_000, "retry-after", NOW)
+    assert.equal(pruneCooldown("acct-a"), true)
+    assert.equal(readRotationState().cooldowns["acct-a"], undefined)
+    assert.ok(readRotationState().cooldowns["acct-b"])
+    assert.equal(pruneCooldown("acct-a"), false)
   })
 })

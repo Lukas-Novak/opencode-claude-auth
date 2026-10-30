@@ -130,7 +130,7 @@ Pick **"Add Claude token (paste from `claude setup-token`)"** and paste. You can
 
 Pasting a token switches to it immediately. Re-pasting a token you already have is a no-op, not a duplicate account.
 
-To remove one, run `opencode auth login` and pick **"Remove a stored Claude token"**.
+To remove one, run `opencode auth login` and pick **"Remove a stored Claude token"**. Removal is a full logout: the account leaves the rotation pool immediately, its rate-limit bench and cached credentials are purged, the active session is re-pointed to the first remaining account, and nothing is left behind — re-paste the token any time to add it back cleanly.
 
 Tokens are stored in `~/.local/share/opencode/claude-auth-tokens.json` with `0600` permissions. They are secrets — treat that file like an SSH key. If the store can't be written, the paste still applies for the rest of the session and says so.
 
@@ -162,6 +162,7 @@ When a request comes back rate-limited, the plugin benches that account and retr
 - **How long depends on what the API says.** A `retry-after` or `anthropic-ratelimit-unified-*-reset` header sets the bench; an unexplained 429 gets a short 60s bench instead, so a transient blip doesn't write an account off for hours. Benches are capped at 6h.
 - **A bench clears as soon as the account works again**, so an early reset doesn't leave it sitting out.
 - **Long-context 429s don't rotate.** That error is about request headers, not your allowance, and every account shares it — it's handled by the existing beta-flag retry instead.
+- **Organisation-blocked accounts rotate too.** A 403 saying "OAuth authentication is currently not allowed for this organization." means the account's org forbids OAuth auth, so the account is benched for the maximum cooldown (default 6h) and the request moves on exactly as with a rate limit; the long bench doubles as a periodic re-probe in case the org changes course or the token is re-authenticated. One difference from quotas: nothing ever *resets*, so if every benched account is org-blocked, the request fails immediately with that 403 instead of parking for hours. Any other 403 is returned untouched and benches nothing.
 
 The account picker in `opencode auth login` shows which accounts are benched and for how long. A request skips a benched sticky account when another account is eligible.
 
@@ -180,9 +181,10 @@ node scripts/e2e-notouch.mjs --scenario concurrent
 node scripts/e2e-notouch.mjs --scenario stop
 node scripts/e2e-notouch.mjs --scenario deadline
 node scripts/e2e-notouch.mjs --scenario long
+node scripts/e2e-notouch.mjs --scenario org
 ```
 
-The sandbox scenarios start their own OpenCode server, use an isolated HOME/config/cache and mock tokens, and route plugin HTTP requests exclusively to a loopback stub. `long` takes roughly six minutes and asserts that automatic completion crosses the actual 300-second boundary. `deadline` shortens OpenCode's header deadline to exercise native retry. Successful runs remove their sandbox; failures print its path for inspection. Set `OPENCODE_BIN` to use a particular OpenCode binary.
+The sandbox scenarios start their own OpenCode server, use an isolated HOME/config/cache and mock tokens, and route plugin HTTP requests exclusively to a loopback stub. `long` takes roughly six minutes and asserts that automatic completion crosses the actual 300-second boundary. `deadline` shortens OpenCode's header deadline to exercise native retry. `org` organisation-blocks the first account (403 "OAuth authentication is currently not allowed for this organization.") and checks the session rotates past it and still waits out the remaining account's rate limit. Successful runs remove their sandbox; failures print its path for inspection. Set `OPENCODE_BIN` to use a particular OpenCode binary.
 
 ### Seeing the real next-attempt countdown
 

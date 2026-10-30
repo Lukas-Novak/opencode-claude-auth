@@ -82,6 +82,16 @@ export function setActiveAccountSource(source: string): void {
   }
 }
 
+/**
+ * Drop every in-memory holdover of an account: cached credentials and any
+ * in-flight refresh. Removing an account from the token store must leave
+ * nothing behind that could still serve (or refresh) its credentials.
+ */
+export function purgeAccountRuntimeState(source: string): void {
+  accountCacheMap.delete(source)
+  inFlightRefreshes.delete(source)
+}
+
 export function refreshAccountsList(): ClaudeAccount[] {
   const fresh = readAllClaudeAccounts()
   if (fresh.length === 0 && allAccounts.length > 0) {

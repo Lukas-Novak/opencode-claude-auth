@@ -40,6 +40,7 @@ import {
   retryAfterCooldownWait,
   noteAccountSucceeded,
   chooseInitialAccount,
+  purgeAccountRuntimeState,
   type ClaudeCredentials,
 } from "./credentials.ts"
 import {
@@ -55,6 +56,9 @@ import {
   getRotationStatePath,
   cooldownFromResponse,
   markRateLimited,
+  pruneCooldown,
+  isHardAuthCooldownReason,
+  ORG_OAUTH_NOT_ALLOWED_REASON,
 } from "./rotation.ts"
 import {
   addTokens,
@@ -65,6 +69,7 @@ import {
   tokenFingerprint,
   validateTokenInput,
   getTokenStorePath,
+  TOKEN_SOURCE_PREFIX,
 } from "./token-store.ts"
 
 export {
@@ -336,6 +341,21 @@ function deferred429(context: AvailabilityContext): Response {
   )
 }
 
+/**
+ * The 403 Anthropic returns when the token's organisation forbids OAuth
+ * auth ("OAuth authentication is currently not allowed for this
+ * organization."). That is an account-level failure indistinguishable from a
+ * quota block on every one of its tokens, so rotation treats it like a 429 —
+ * except nothing ever resets on its own, hence the long {@link
+ * ORG_OAUTH_NOT_ALLOWED_REASON} bench that doubles as a re-probe schedule.
+ */
+const ORG_OAUTH_NOT_ALLOWED_PATTERN =
+  /oauth authentication is currently not allowed/i
+
+function isOrgOAuthNotAllowed(body: string): boolean {
+  return ORG_OAUTH_NOT_ALLOWED_PATTERN.test(body)
+}
+
 /** The sole owner of quota waiting. File events wake it early; timer ticks
  * re-read local state only. HTTP is attempted only after a candidate is eligible.
  * It never re-benches a stale response while waiting; OpenCode's own wrapper
@@ -390,6 +410,17 @@ async function acquireAvailableAccount(
       context.lastEarliestLabel = earliest?.account.label
       if (!earliest) return null
       if (!options.enabled) return null
+      // Hard-auth benches (org forbids OAuth) never expire into a usable
+      // account. When they are the only benches left there is no reset to
+      // sleep toward: fail instead of parking the request for hours.
+      if (
+        limited.every((item) => isHardAuthCooldownReason(item.entry!.reason))
+      ) {
+        log("rotation_wait_skipped_hard_auth", {
+          benches: limited.map((item) => item.account.source),
+        })
+        return null
+      }
       if (options.maxCycles > 0 && context.cycles >= options.maxCycles)
         return null
       if (startedAt === undefined) startedAt = now
@@ -991,9 +1022,17 @@ const plugin: Plugin = async (pluginInput) => {
               }
             }
 
-            // Still rate-limited after the external-switch check, so this
-            // account is genuinely out of allowance as far as this session can
-            // tell. Bench it and walk down the priority order.
+            // Still rate-limited (or org-blocked) after the external-switch
+            // check, so this account is genuinely out of allowance as far as
+            // this session can tell. Bench it and walk down the priority
+            // order.
+            //
+            // Two account-level failures justify rotation: a quota 429
+            // (benched from whatever reset hint the response carried) and a
+            // 403 reporting that the account's organisation forbids OAuth
+            // (benched for the ceiling — nothing resets on its own, so the
+            // bench doubles as a periodic re-probe schedule). Every other
+            // status leaves the pool untouched and is returned as-is.
             //
             // Ordered after the external-switch block on purpose: if another
             // process already rotated us onto a healthy account, that costs no
@@ -1012,15 +1051,23 @@ const plugin: Plugin = async (pluginInput) => {
             // survives a quota window however long it is; the abort signal is
             // the escape hatch, and OPENCODE_CLAUDE_AUTH_ROTATE_WAIT* can
             // bound or disable the waiting for callers that prefer to fail.
-            if (response.status === 429 && getRotationConfig().enabled) {
+            // The one exception: hard-auth benches (org forbids OAuth) never
+            // recover on their own, so waiting toward one of those alone
+            // would be parking forever — acquireAvailableAccount refuses and
+            // the original error surfaces instead.
+            if (
+              (response.status === 429 || response.status === 403) &&
+              getRotationConfig().enabled
+            ) {
               const rotationConfig = getRotationConfig()
               let switches = 0
-              while (response.status === 429) {
+              while (response.status === 429 || response.status === 403) {
                 throwIfAborted(requestInit.signal)
 
-                // Body is needed both to exclude long-context errors and to
-                // tell an explained usage limit from a bare 429. Cloned so
-                // the response stays readable if we end up returning it.
+                // Body is needed both to exclude long-context errors, to
+                // tell an explained usage limit from a bare 429, and to
+                // recognise the org-block 403. Cloned so the response stays
+                // readable if we end up returning it.
                 let limitBody = ""
                 try {
                   limitBody = await response.clone().text()
@@ -1029,20 +1076,33 @@ const plugin: Plugin = async (pluginInput) => {
                   // only costs the body-derived reason label.
                 }
 
-                if (isLongContextError(limitBody)) {
-                  log("rotation_skipped_long_context", { modelId })
+                const orgBlocked =
+                  response.status === 403 && isOrgOAuthNotAllowed(limitBody)
+                if (response.status === 429) {
+                  if (isLongContextError(limitBody)) {
+                    log("rotation_skipped_long_context", { modelId })
+                    break
+                  }
+                } else if (!orgBlocked) {
+                  // A 403 that is not the org-block message is an ordinary
+                  // error response: no bench, no rotation.
                   break
                 }
 
                 const limitedSource = servingSource
                 if (!limitedSource) break
 
-                const { ms, reason } = cooldownFromResponse(
-                  response.headers,
-                  limitBody,
-                  rotationConfig,
-                  rotationWaitDeps.now(),
-                )
+                const { ms, reason } = orgBlocked
+                  ? {
+                      ms: rotationConfig.maxCooldownMs,
+                      reason: ORG_OAUTH_NOT_ALLOWED_REASON,
+                    }
+                  : cooldownFromResponse(
+                      response.headers,
+                      limitBody,
+                      rotationConfig,
+                      rotationWaitDeps.now(),
+                    )
                 markRateLimited(
                   limitedSource,
                   ms,
@@ -1090,7 +1150,9 @@ const plugin: Plugin = async (pluginInput) => {
                 syncAuthJson(rotated.credentials)
                 notify(
                   toastClient,
-                  `Rate limit reached — switched to ${rotated.account.label}.`,
+                  orgBlocked
+                    ? `OAuth blocked by this account's organisation — switched to ${rotated.account.label}.`
+                    : `Rate limit reached — switched to ${rotated.account.label}.`,
                   "warning",
                 )
 
@@ -1396,13 +1458,25 @@ const plugin: Plugin = async (pluginInput) => {
 
           async authorize(inputs) {
             const id = inputs?.id
+            // The removed token may be the active account, so capture it
+            // before removal to re-point the session afterwards.
+            const activeBefore = getActiveAccount()?.source ?? null
             const removed = id ? removeToken(id) : false
+            if (removed && id) {
+              // Removal is a logout: the account's bench state, cached
+              // credentials, and in-flight refreshes expire with it, so a
+              // later re-paste starts with a completely clean slate.
+              const source = `${TOKEN_SOURCE_PREFIX}${id}`
+              pruneCooldown(source)
+              purgeAccountRuntimeState(source)
+            }
             const roster = refreshAccountsList()
 
-            // The removed token may have been the active account, so re-resolve
-            // rather than assuming the session still has usable credentials.
-            const stillActive = getActiveAccount()
-            if (!stillActive && roster[0]) {
+            if (
+              activeBefore &&
+              !roster.some((account) => account.source === activeBefore) &&
+              roster[0]
+            ) {
               setActiveAccountSource(roster[0].source)
               saveAccountSource(roster[0].source)
             }

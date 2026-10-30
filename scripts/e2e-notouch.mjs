@@ -27,7 +27,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 const scenario = process.argv[process.argv.indexOf("--scenario") + 1] ?? "long"
 const mode = process.argv.includes("--scenario") ? scenario : "long"
 assert.ok(
-  ["long", "concurrent", "deadline", "stop"].includes(mode),
+  ["long", "concurrent", "deadline", "stop", "org"].includes(mode),
   "unknown scenario",
 )
 const pluginDir = resolvePath(
@@ -155,6 +155,23 @@ const stub = createServer((req, res) => {
         `unexpected stub request: ${req.method} ${req.url}, marker=${marker}, account=${token?.label}`,
       )
       res.writeHead(400).end("unexpected request")
+      return
+    }
+    // Org scenario: account A is always organisation-blocked (403), never a
+    // quota limit; the plugin must rotate to B and still wait out B's 429.
+    if (mode === "org" && token.label === "A") {
+      hits.push({ at: Date.now(), account: token.label, marker, status: 403 })
+      res.writeHead(403, { "content-type": "application/json" })
+      res.end(
+        JSON.stringify({
+          type: "error",
+          error: {
+            type: "permission_error",
+            message:
+              "OAuth authentication is currently not allowed for this organization.",
+          },
+        }),
+      )
       return
     }
     if (token.label === "B" && bResetAt === undefined)
@@ -382,6 +399,30 @@ try {
       "must cross the actual 300s boundary",
     )
   const trace = events()
+  if (mode === "org") {
+    const aHits = hits.filter((h) => h.account === "A")
+    assert.ok(aHits.length >= 1, "org scenario must probe A at least once")
+    assert.ok(
+      aHits.every((h) => h.status === 403),
+      "A must only ever receive org 403s",
+    )
+    const rotation = JSON.parse(readFileSync(rotationPath, "utf8"))
+    assert.equal(
+      rotation.cooldowns[`token:${tokens[0].id}`]?.reason,
+      "oauth-org-not-allowed",
+      "org-blocked account must be benched with the hard-auth reason",
+    )
+    assert.ok(
+      trace.some(
+        (e) => e.event === "rotation_marked_limited" && e.reason === "oauth-org-not-allowed",
+      ),
+      "org block must be recorded as a hard-auth bench in the debug log",
+    )
+    assert.ok(
+      !trace.some((e) => e.event === "rotation_wait_skipped_hard_auth"),
+      "with a recoverable bench pending, waiting must not be skipped",
+    )
+  }
   if (mode === "deadline")
     assert.ok(
       trace.some((e) => e.event === "rotation_deferred_retry"),

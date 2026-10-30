@@ -440,6 +440,26 @@ export function isAuthoritativeCooldownReason(reason: string): boolean {
 }
 
 /**
+ * Bench reason for a 403 reporting that the account's organisation forbids
+ * OAuth auth ("OAuth authentication is currently not allowed for this
+ * organization."). Unlike a quota bench nothing ever *resets*: the org admin
+ * must change course or the user must re-paste a fresh token, so the ceiling
+ * (`maxCooldownMs`) doubles as a periodic re-probe schedule in case either
+ * happened out of band.
+ */
+export const ORG_OAUTH_NOT_ALLOWED_REASON = "oauth-org-not-allowed"
+
+/**
+ * Cooldown reasons an account cannot recover from on its own. Quota waiting
+ * must never sleep toward one of these: there is no reset on the other side,
+ * so when they are the only benches left the request must fail rather than
+ * park for hours.
+ */
+export function isHardAuthCooldownReason(reason: string): boolean {
+  return reason === ORG_OAUTH_NOT_ALLOWED_REASON
+}
+
+/**
  * Bench length for a 429 that said nothing about when to come back
  * ({@link cooldownFromResponse} reasons `unspecified-429` and
  * `usage-limit-body`).
@@ -539,6 +559,22 @@ export function clearCooldown(source: string, now = Date.now()): void {
     delete state.cooldowns[source]
     writeRotationState(state)
     log("rotation_cooldown_cleared", { source, at: now })
+  })
+}
+
+/**
+ * Drop a bench because the account itself is gone (removed from the token
+ * store), not because it proved healthy — unlike clearCooldown there is no
+ * source left to re-test, so a removal is a plain prune of dead state.
+ */
+export function pruneCooldown(source: string): boolean {
+  return mutateRotationState(() => {
+    const state = readRotationState()
+    if (!state.cooldowns[source]) return false
+    delete state.cooldowns[source]
+    writeRotationState(state)
+    log("rotation_cooldown_pruned", { source })
+    return true
   })
 }
 
